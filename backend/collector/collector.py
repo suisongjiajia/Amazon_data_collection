@@ -65,24 +65,32 @@ class AmazonCollector:
         if not parsed.asin:
             raise ValueError("商品 URL 缺少 ASIN")
 
-        html = self._fetch(parsed.listing_url, parsed)
-        doc = BeautifulSoup(html, "html.parser")
-        shared = self._extract_shared_product_fields(doc)
+        doc, html = self._fetch_product_document(parsed.listing_url, parsed, strict=True)
         variants = self._extract_variant_options(doc, html, parsed.asin)
 
         if len(variants) <= 1:
             variant = variants[0] if variants else VariantOption(asin=parsed.asin)
-            return [self._build_product_info(doc, parsed, variant, shared)]
+            family_variant_asins = [variant.asin]
+            shared = self._extract_shared_product_fields(doc)
+            return [self._build_product_info(doc, parsed, variant, shared, family_variant_asins)]
 
         results: list[ProductInfo] = []
+        family_variant_asins = [variant.asin for variant in variants if variant.asin]
         for index, variant in enumerate(variants):
             if variant.asin == parsed.asin:
                 variant_doc = doc
             else:
                 if index > 0:
                     self._sleep(self.config.delay_ms)
-                variant_doc = self._fetch_document(parsed.build_product_url(variant.asin), parsed)
-            results.append(self._build_product_info(variant_doc, parsed, variant, shared))
+                variant_doc, _ = self._fetch_product_document(
+                    parsed.build_product_url(variant.asin),
+                    parsed,
+                    strict=False,
+                )
+            shared = self._extract_shared_product_fields(variant_doc)
+            results.append(
+                self._build_product_info(variant_doc, parsed, variant, shared, family_variant_asins)
+            )
         return results
 
     def collect_product(self, parsed: ParseResult) -> ProductInfo:
@@ -132,7 +140,7 @@ class AmazonCollector:
         session: requests.Session | None = None,
     ) -> ProductInfo | None:
         try:
-            doc = self._fetch_document(parsed.build_product_url(asin), parsed, session)
+            doc, _ = self._fetch_product_document(parsed.build_product_url(asin), parsed, strict=True, session=session)
         except RuntimeError:
             return None
 
@@ -159,6 +167,7 @@ class AmazonCollector:
         parsed: ParseResult,
         variant: VariantOption,
         shared: dict[str, object],
+        family_variant_asins: list[str] | None = None,
     ) -> ProductInfo:
         product_url = parsed.build_product_url(variant.asin)
         return ProductInfo(
@@ -173,6 +182,7 @@ class AmazonCollector:
             size=variant.size,
             color=variant.color,
             variant_attributes=dict(variant.attributes),
+            family_variant_asins=family_variant_asins or [variant.asin],
             bullet_points=shared.get("bullet_points") or [],  # type: ignore[arg-type]
             collected_at=datetime.now(),
         )
@@ -324,6 +334,41 @@ class AmazonCollector:
         html = self._fetch(url, parsed, session)
         return BeautifulSoup(html, "html.parser")
 
+    def _fetch_product_document(
+        self,
+        url: str,
+        parsed: ParseResult,
+        *,
+        strict: bool,
+        session: requests.Session | None = None,
+    ) -> tuple[BeautifulSoup, str]:
+        last_doc: BeautifulSoup | None = None
+        last_html = ""
+        best_valid_doc: BeautifulSoup | None = None
+        best_valid_html = ""
+
+        for attempt in range(3):
+            if attempt > 0:
+                self._sleep(self.config.delay_ms)
+
+            html = self._fetch(url, parsed, session)
+            doc = BeautifulSoup(html, "html.parser")
+            last_doc = doc
+            last_html = html
+
+            if self._is_valid_product_document(doc):
+                if best_valid_doc is None:
+                    best_valid_doc = doc
+                    best_valid_html = html
+                if self._extract_price(doc):
+                    return doc, html
+        if best_valid_doc is not None:
+            return best_valid_doc, best_valid_html
+
+        if strict:
+            raise RuntimeError(f"Failed to load a complete Amazon product page: {url}")
+        return last_doc or BeautifulSoup(last_html, "html.parser"), last_html
+
     def _fetch(
         self,
         url: str,
@@ -342,6 +387,21 @@ class AmazonCollector:
         if not response.ok:
             raise RuntimeError(f"请求失败 HTTP {response.status_code}: {url}")
         return response.text
+
+    def _is_valid_product_document(self, doc: BeautifulSoup) -> bool:
+        title = self._extract_title(doc)
+        if not title:
+            return False
+
+        return any(
+            (
+                self._extract_price(doc),
+                self._extract_main_image(doc),
+                self._extract_brand(doc),
+                self._extract_bullets(doc),
+                self._extract_rating(doc),
+            )
+        )
 
     def _clone_session(self) -> requests.Session:
         session = requests.Session()

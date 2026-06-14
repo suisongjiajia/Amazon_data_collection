@@ -815,6 +815,22 @@ a {
   font-size: 13px;
 }
 
+.selector-row {
+  cursor: default;
+}
+
+.selector-main {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.selector-main input[type="checkbox"] {
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+}
+
 .draft-layout {
   display: grid;
   grid-template-columns: 300px minmax(0, 1fr);

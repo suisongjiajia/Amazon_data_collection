@@ -45,6 +45,8 @@ class ProductInfo:
     size: str | None = None
     color: str | None = None
     variant_attributes: dict[str, str] = field(default_factory=dict)
+    family_key: str | None = None
+    family_variant_asins: list[str] = field(default_factory=list)
     bullet_points: list[str] = field(default_factory=list)
     collected_at: datetime | None = None
 
@@ -61,6 +63,8 @@ class ProductInfo:
             "size": self.size,
             "color": self.color,
             "variantAttributes": self.variant_attributes or None,
+            "familyKey": self.family_key,
+            "familyVariantAsins": self.family_variant_asins or None,
             "bulletPoints": self.bullet_points or None,
             "collectedAt": self.collected_at.isoformat() if self.collected_at else None,
         }
