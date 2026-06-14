@@ -1,0 +1,8 @@
+INFO:     127.0.0.1:53070 - "GET /api/health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53115 - "GET /api/collections HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53116 - "GET /api/raw-products HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53117 - "GET /api/selections HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53118 - "GET /api/products HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53119 - "GET /api/listing-drafts HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53120 - "GET /api/publish-tasks HTTP/1.1" 200 OK
+INFO:     127.0.0.1:53128 - "GET /api/listing-live HTTP/1.1" 200 OK

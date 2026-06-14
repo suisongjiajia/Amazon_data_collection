@@ -1,0 +1,24 @@
+### Python ###
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.python/
+*.egg-info/
+dist/
+build/
+
+### Node ###
+node_modules/
+frontend/dist/
+
+### Env ###
+.env
+
+### IDE ###
+.idea/
+*.iml
+
+### OS ###
+.DS_Store
