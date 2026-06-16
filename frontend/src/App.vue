@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 
-type ViewKey = "collections" | "families" | "selections" | "products" | "drafts" | "publish";
+type ViewKey = "intake" | "selections" | "listing" | "publish";
+type IntakeTab = "families" | "tasks";
 type ValidationLevel = "pass" | "warn" | "fail";
 
 interface CollectionTask {
@@ -22,6 +23,7 @@ interface RawProductVariant {
   id: number;
   family_id: number;
   asin?: string | null;
+  parent_asin?: string | null;
   source_url?: string | null;
   title?: string | null;
   price_text?: string | null;
@@ -29,6 +31,8 @@ interface RawProductVariant {
   size?: string | null;
   color?: string | null;
   variant_attributes?: Record<string, string> | null;
+  snapshot_time?: string | null;
+  raw_payload?: Record<string, unknown> | null;
 }
 
 interface RawProductFamily {
@@ -191,15 +195,14 @@ interface ValidationItem {
 }
 
 const views: ViewDefinition[] = [
-  { key: "collections", label: "采集任务", meta: "任务与最近入库结果" },
-  { key: "families", label: "商品族库", meta: "按 family 浏览原始数据" },
+  { key: "intake", label: "采集入库", meta: "采集链接、任务与商品族" },
   { key: "selections", label: "选品池", meta: "按 family 选品并圈定变体" },
-  { key: "products", label: "商品中心", meta: "1 SPU + 多 SKU 建档结果" },
-  { key: "drafts", label: "Listing 草稿", meta: "编辑多 SKU 草稿" },
+  { key: "listing", label: "Listing 工作台", meta: "SPU 建档与草稿编辑" },
   { key: "publish", label: "发布中心", meta: "模拟发布与回写结果" },
 ];
 
-const activeView = ref<ViewKey>("collections");
+const activeView = ref<ViewKey>("intake");
+const intakeTab = ref<IntakeTab>("families");
 const loading = ref(false);
 const notice = ref("");
 const error = ref("");
@@ -207,13 +210,15 @@ const collectionUrl = ref("");
 const defaultShopName = ref("Demo Shop");
 const defaultMarketplace = ref("www.amazon.com");
 const selectedDraftId = ref<number | null>(null);
+const selectedFamilyId = ref<number | null>(null);
+const selectedSelectionId = ref<number | null>(null);
+const expandedVariantId = ref<number | null>(null);
 
 const filters = reactive({
   familyQuery: "",
   familyMarketplace: "all",
   selectionQuery: "",
-  productQuery: "",
-  draftQuery: "",
+  listingQuery: "",
 });
 
 const state = reactive({
@@ -227,8 +232,6 @@ const state = reactive({
 });
 
 const selectionScopeState = reactive<Record<number, number[]>>({});
-const familyExpandedState = reactive<Record<number, boolean>>({});
-const selectionExpandedState = reactive<Record<number, boolean>>({});
 
 const draftEditor = reactive({
   title: "",
@@ -240,19 +243,12 @@ const draftEditor = reactive({
 
 const heroContent = computed(() => {
   switch (activeView.value) {
-    case "collections":
+    case "intake":
       return {
-        kicker: "Collection",
-        title: "采集先落成商品族，再进入后续业务流转",
-        description: "原始层只保留 family 与 variant。采集成功后，选品、建档和草稿都基于同一套结构继续推进。",
-        aside: "当前设计中，单个 selection 会生成 1 个 SPU 和多个 SKU。",
-      };
-    case "families":
-      return {
-        kicker: "Raw Layer",
-        title: "原始商品列表已经替换为商品族列表",
-        description: "这里展示 family 聚合结果，以及每个 family 下的全部原始变体。",
-        aside: "如果一个 family 已入选或已建档，会直接显示在卡片状态上。",
+        kicker: "Intake",
+        title: "采集入库：发起采集并管理商品族",
+        description: "在同一模块完成链接采集、查看任务记录与浏览入库商品族。",
+        aside: "商品族是后续选品与上架的原始数据层。",
       };
     case "selections":
       return {
@@ -261,24 +257,17 @@ const heroContent = computed(() => {
         description: "选品后默认纳入全量变体。你可以在这里缩小 variant scope，再生成 SPU 和多 SKU。",
         aside: "这一步决定了最终会创建哪些 SKU。",
       };
-    case "products":
+    case "listing":
       return {
-        kicker: "Catalog",
-        title: "建档结果已经切换到 1 SPU + 多 SKU",
-        description: "每个 product master 对应一个 selection；其下的 SKU 来自选中的 variant scope。",
-        aside: "产品层不再直接绑定单个原始快照。",
-      };
-    case "drafts":
-      return {
-        kicker: "Draft",
-        title: "多 SKU 草稿统一编辑、校验和发布",
-        description: "草稿按 SPU 管理，价格、库存和编码按 SKU 逐条维护。",
+        kicker: "Listing",
+        title: "Listing 工作台：建档、草稿与发布前编辑",
+        description: "以 SPU 为主查看建档结果，在同一页面创建和编辑 Listing 草稿。",
         aside: "发布前检查主要看文案完整度和 SKU 参数完整度。",
       };
     case "publish":
       return {
         kicker: "Publish",
-        title: "发布任务与线上回写状态分开展示",
+        title: "发布任务与线上回写状态",
         description: "先确保模拟发布和错误定位闭环稳定，再接真实发布。",
         aside: "当前展示的是发布任务和已回写的 live SKU 状态。",
       };
@@ -286,11 +275,17 @@ const heroContent = computed(() => {
 });
 
 const summaryCards = computed(() => [
-  { label: "采集任务", hint: "累计任务数", value: String(state.collections.length) },
-  { label: "商品族", hint: "原始 family 数", value: String(state.families.length) },
+  {
+    label: "采集入库",
+    hint: `${state.collections.length} 任务 · ${state.families.length} 商品族`,
+    value: String(state.families.length),
+  },
   { label: "选品池", hint: "已创建 selection", value: String(state.selections.length) },
-  { label: "SPU", hint: "已建档商品主档", value: String(state.products.length) },
-  { label: "草稿", hint: "待发布草稿", value: String(state.drafts.length) },
+  {
+    label: "Listing",
+    hint: `${state.products.length} SPU · ${state.drafts.length} 草稿`,
+    value: String(state.drafts.length || state.products.length),
+  },
   { label: "Live SKU", hint: "已回写 SKU", value: String(state.liveListings.length) },
 ]);
 
@@ -327,28 +322,62 @@ const filteredSelections = computed(() => {
   });
 });
 
-const filteredProducts = computed(() => {
-  const query = filters.productQuery.trim().toLowerCase();
+const filteredListingProducts = computed(() => {
+  const query = filters.listingQuery.trim().toLowerCase();
   return state.products.filter((product) => {
     if (!query) {
       return true;
     }
-    return [product.spu_code, product.product_name, product.brand].some((value) =>
+    const drafts = getDraftsForProduct(product.id);
+    const productMatches = [product.spu_code, product.product_name, product.brand].some((value) =>
       normalizeText(value).includes(query),
     );
+    const draftMatches = drafts.some((draft) =>
+      [draft.product_name, draft.spu_code, draft.shop_name, draft.marketplace, draft.title].some((value) =>
+        normalizeText(value).includes(query),
+      ),
+    );
+    return productMatches || draftMatches;
   });
 });
 
-const filteredDrafts = computed(() => {
-  const query = filters.draftQuery.trim().toLowerCase();
-  return state.drafts.filter((draft) => {
-    if (!query) {
-      return true;
-    }
-    return [draft.product_name, draft.spu_code, draft.shop_name, draft.marketplace].some((value) =>
-      normalizeText(value).includes(query),
-    );
-  });
+const collectionListRows = computed(() =>
+  state.collections.map((task) => {
+    const linkedFamilies = state.families.filter((family) => family.task_id === task.id);
+    const lead = linkedFamilies[0];
+    const title =
+      linkedFamilies.length > 1
+        ? `${lead?.title ?? "未命名商品"} 等 ${linkedFamilies.length} 个商品族`
+        : (lead?.title ?? "待解析标题");
+    return {
+      task,
+      title,
+      image: lead ? getFamilyImage(lead) : "",
+      sourceUrl: task.source_url,
+      marketplace: task.marketplace ?? lead?.marketplace,
+    };
+  }),
+);
+
+const selectedFamily = computed(() => {
+  if (selectedFamilyId.value === null) {
+    return null;
+  }
+  return state.families.find((family) => family.id === selectedFamilyId.value) ?? null;
+});
+
+const selectedSelection = computed(() => {
+  if (selectedSelectionId.value === null) {
+    return null;
+  }
+  return state.selections.find((selection) => selection.id === selectedSelectionId.value) ?? null;
+});
+
+const selectedSelectionFamily = computed(() => {
+  if (!selectedSelection.value) {
+    return null;
+  }
+  return getSelectionVariantFamily(selectedSelection.value);
 });
 
 const selectedDraft = computed<ListingDraft | null>(() => {
@@ -427,6 +456,23 @@ const draftValidationItems = computed<ValidationItem[]>(() => {
   ];
 });
 
+watch(activeView, (view) => {
+  if (view !== "intake") {
+    selectedFamilyId.value = null;
+    expandedVariantId.value = null;
+  }
+  if (view !== "selections") {
+    selectedSelectionId.value = null;
+  }
+  if (view !== "listing") {
+    selectedDraftId.value = null;
+  }
+});
+
+watch(selectedFamilyId, () => {
+  expandedVariantId.value = null;
+});
+
 watch(
   selectedDraft,
   (draft) => {
@@ -472,16 +518,8 @@ async function refreshAll(): Promise<void> {
     state.publishTasks = publishTasks;
     state.liveListings = liveListings;
 
-    for (const family of families) {
-      if (!(family.id in familyExpandedState)) {
-        familyExpandedState[family.id] = false;
-      }
-    }
     for (const selection of selections) {
       selectionScopeState[selection.id] = selection.variants.map((variant) => variant.id);
-      if (!(selection.id in selectionExpandedState)) {
-        selectionExpandedState[selection.id] = true;
-      }
     }
 
     if (drafts.length > 0) {
@@ -508,6 +546,8 @@ async function submitCollection(): Promise<void> {
     });
     notice.value = "采集任务已提交并完成入库";
     collectionUrl.value = "";
+    activeView.value = "intake";
+    intakeTab.value = "tasks";
     await refreshAll();
   });
 }
@@ -551,7 +591,7 @@ async function createProduct(selectionId: number): Promise<void> {
       }),
     });
     notice.value = "已生成 1 个 SPU 和对应多个 SKU";
-    activeView.value = "products";
+    activeView.value = "listing";
     await refreshAll();
   });
 }
@@ -567,8 +607,12 @@ async function createDraft(productMasterId: number): Promise<void> {
       }),
     });
     notice.value = "Listing 草稿已创建";
-    activeView.value = "drafts";
+    activeView.value = "listing";
     await refreshAll();
+    const created = state.drafts.find((draft) => draft.product_master_id === productMasterId);
+    if (created) {
+      selectedDraftId.value = created.id;
+    }
   });
 }
 
@@ -731,6 +775,163 @@ function normalizeText(value?: string | null): string {
   return (value ?? "").toString().trim().toLowerCase();
 }
 
+function getFamilyImage(family: RawProductFamily | Selection): string {
+  if ("family_main_image_url" in family && family.family_main_image_url) {
+    return family.family_main_image_url;
+  }
+  if ("main_image_url" in family && family.main_image_url) {
+    return family.main_image_url;
+  }
+  const variants = "variants" in family ? family.variants : [];
+  return variants[0]?.main_image_url ?? "";
+}
+
+function getFamilyStatusLabel(family: RawProductFamily): string {
+  if (family.product_master_id) {
+    return "已建档";
+  }
+  if (family.selection_status) {
+    return getStatusLabel(family.selection_status);
+  }
+  return "已采集";
+}
+
+function getFamilyStatusKey(family: RawProductFamily): string {
+  if (family.product_master_id) {
+    return "converted";
+  }
+  if (family.selection_status) {
+    return family.selection_status;
+  }
+  return "completed";
+}
+
+function getDraftImage(draft: ListingDraft): string {
+  const product = state.products.find((item) => item.id === draft.product_master_id);
+  return product?.family_main_image_url ?? "";
+}
+
+function truncateUrl(value?: string | null, maxLength = 56): string {
+  if (!value) {
+    return "—";
+  }
+  return value.length > maxLength ? `${value.slice(0, maxLength)}…` : value;
+}
+
+function openFamilyDetail(familyId: number): void {
+  intakeTab.value = "families";
+  selectedFamilyId.value = familyId;
+  expandedVariantId.value = null;
+}
+
+function closeFamilyDetail(): void {
+  selectedFamilyId.value = null;
+  expandedVariantId.value = null;
+}
+
+function openSelectionDetail(selectionId: number): void {
+  selectedSelectionId.value = selectionId;
+  expandedVariantId.value = null;
+}
+
+function closeSelectionDetail(): void {
+  selectedSelectionId.value = null;
+  expandedVariantId.value = null;
+}
+
+function getFamilyContextForSelection(selection: Selection): RawProductFamily | null {
+  return state.families.find((family) => family.id === selection.raw_product_family_id) ?? null;
+}
+
+function getSelectionVariantFamily(selection: Selection): RawProductFamily {
+  const family = getFamilyContextForSelection(selection);
+  if (family) {
+    return family;
+  }
+
+  return {
+    id: selection.raw_product_family_id,
+    family_key: selection.family_key || "",
+    title: selection.family_title,
+    brand: selection.family_brand,
+    marketplace: selection.family_marketplace,
+    source_url: selection.family_source_url,
+    variant_count: selection.family_variant_count,
+    variants: selection.variants,
+  };
+}
+
+function getDraftsForProduct(productId: number): ListingDraft[] {
+  return state.drafts.filter((draft) => draft.product_master_id === productId);
+}
+
+function openDraftEditor(draftId: number): void {
+  selectedDraftId.value = draftId;
+}
+
+function openListingForProduct(productId: number): void {
+  const drafts = getDraftsForProduct(productId);
+  if (drafts.length > 0) {
+    selectedDraftId.value = drafts[0].id;
+    return;
+  }
+  void createDraft(productId);
+}
+
+function toggleVariantDetail(variantId: number): void {
+  expandedVariantId.value = expandedVariantId.value === variantId ? null : variantId;
+}
+
+function isVariantExpanded(variantId: number): boolean {
+  return expandedVariantId.value === variantId;
+}
+
+function getVariantTitle(variant: RawProductVariant, family?: RawProductFamily | null): string {
+  return variant.title || family?.title || "未命名变体";
+}
+
+function getVariantImage(variant: RawProductVariant): string {
+  return variant.main_image_url ?? "";
+}
+
+function getVariantBulletPoints(
+  variant: RawProductVariant,
+  family?: RawProductFamily | null,
+): string[] {
+  const payload = variant.raw_payload;
+  const fromPayload = payload?.bulletPoints;
+  if (Array.isArray(fromPayload)) {
+    const bullets = fromPayload.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+    if (bullets.length > 0) {
+      return bullets;
+    }
+  }
+
+  return (family?.bullet_points ?? []).filter((item) => item.trim().length > 0);
+}
+
+function getVariantAttributeEntries(variant: RawProductVariant): Array<[string, string]> {
+  const entries: Array<[string, string]> = [];
+  const seen = new Set<string>();
+
+  for (const [key, value] of Object.entries(variant.variant_attributes ?? {})) {
+    if (!value) {
+      continue;
+    }
+    entries.push([key, value]);
+    seen.add(key.toLowerCase());
+  }
+
+  if (variant.color && !seen.has("color")) {
+    entries.unshift(["Color", variant.color]);
+  }
+  if (variant.size && !seen.has("size")) {
+    entries.unshift(["Size", variant.size]);
+  }
+
+  return entries;
+}
+
 async function apiRequest<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     headers: {
@@ -792,375 +993,730 @@ async function withLoading(action: () => Promise<void>): Promise<void> {
           <em>{{ views.findIndex((item) => item.key === view.key) + 1 }}</em>
         </button>
       </nav>
-
-      <section class="side-panel">
-        <div class="side-title">
-          <small>新采集</small>
-          <h2>直接入库商品族</h2>
-        </div>
-        <label>
-          <span>Amazon 链接</span>
-          <input v-model="collectionUrl" type="text" placeholder="https://www.amazon.com/dp/..." />
-        </label>
-        <button type="button" :disabled="loading" @click="submitCollection">
-          {{ loading ? "处理中..." : "开始采集" }}
-        </button>
-      </section>
-
-      <section class="side-panel">
-        <div class="side-title">
-          <small>默认发布参数</small>
-          <h2>草稿 / 发布</h2>
-        </div>
-        <label>
-          <span>店铺名</span>
-          <input v-model="defaultShopName" type="text" />
-        </label>
-        <label>
-          <span>站点</span>
-          <input v-model="defaultMarketplace" type="text" />
-        </label>
-      </section>
     </aside>
 
     <main class="content">
-      <section class="hero-card">
-        <div class="hero-copy">
-          <p class="eyebrow">{{ heroContent.kicker }}</p>
-          <h2>{{ heroContent.title }}</h2>
-          <p>{{ heroContent.description }}</p>
+      <div class="content-top">
+        <section class="hero-card hero-card-compact">
+          <div class="hero-copy">
+            <p class="eyebrow">{{ heroContent.kicker }}</p>
+            <h2>{{ heroContent.title }}</h2>
+          </div>
+          <div class="hero-side">
+            <button type="button" class="secondary-button" :disabled="loading" @click="refreshAll">
+              刷新数据
+            </button>
+          </div>
+        </section>
+
+        <section class="metric-grid metric-grid-compact">
+          <article v-for="card in summaryCards" :key="card.label" class="metric-card">
+            <span>{{ card.label }}</span>
+            <strong>{{ card.value }}</strong>
+            <small>{{ card.hint }}</small>
+          </article>
+        </section>
+
+        <p v-if="notice" class="notice success">{{ notice }}</p>
+        <p v-if="error" class="notice error">{{ error }}</p>
+      </div>
+
+      <div class="content-scroll">
+      <section v-if="activeView === 'intake'" class="panel-shell">
+        <div class="panel-header">
+          <div>
+            <p class="eyebrow">Intake</p>
+            <h3>{{ selectedFamily && intakeTab === 'families' ? "商品族详情" : "采集入库" }}</h3>
+          </div>
+          <p>
+            {{
+              selectedFamily && intakeTab === "families"
+                ? "查看商品族完整信息与全部变体。"
+                : "发起采集、查看任务记录，或浏览已入库的商品族。"
+            }}
+          </p>
         </div>
-        <div class="hero-side">
-          <p class="hero-note">{{ heroContent.aside }}</p>
-          <button type="button" class="secondary-button" :disabled="loading" @click="refreshAll">
-            刷新数据
+
+        <div class="action-bar">
+          <label class="action-bar-field grow">
+            <span>Amazon 采集链接</span>
+            <input v-model="collectionUrl" type="text" placeholder="https://www.amazon.com/dp/..." />
+          </label>
+          <button type="button" class="action-bar-button" :disabled="loading" @click="submitCollection">
+            {{ loading ? "处理中..." : "开始采集" }}
           </button>
         </div>
-      </section>
 
-      <section class="metric-grid">
-        <article v-for="card in summaryCards" :key="card.label" class="metric-card">
-          <span>{{ card.label }}</span>
-          <strong>{{ card.value }}</strong>
-          <small>{{ card.hint }}</small>
-        </article>
-      </section>
+        <div v-if="!selectedFamily" class="module-tabs">
+          <button
+            type="button"
+            class="module-tab"
+            :class="{ active: intakeTab === 'families' }"
+            @click="intakeTab = 'families'"
+          >
+            商品族
+          </button>
+          <button
+            type="button"
+            class="module-tab"
+            :class="{ active: intakeTab === 'tasks' }"
+            @click="intakeTab = 'tasks'"
+          >
+            任务记录
+          </button>
+        </div>
 
-      <p v-if="notice" class="notice success">{{ notice }}</p>
-      <p v-if="error" class="notice error">{{ error }}</p>
-
-      <section v-if="activeView === 'collections'" class="panel-shell">
-        <div class="panel-header">
-          <div>
-            <p class="eyebrow">Tasks</p>
-            <h3>采集任务记录</h3>
+        <template v-if="intakeTab === 'tasks' && !selectedFamily">
+          <div class="table-wrap list-table" v-if="collectionListRows.length">
+            <table>
+              <thead>
+                <tr>
+                  <th class="col-product">商品</th>
+                  <th>采集链接</th>
+                  <th>站点</th>
+                  <th>状态</th>
+                  <th>成功 / 总数</th>
+                  <th>完成时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in collectionListRows" :key="row.task.id">
+                  <td>
+                    <div class="list-product-cell">
+                      <div class="list-thumb" :class="{ placeholder: !row.image }">
+                        <img v-if="row.image" :src="row.image" :alt="row.title" />
+                        <span v-else>无图</span>
+                      </div>
+                      <div class="list-product-copy">
+                        <strong class="list-title">{{ row.title }}</strong>
+                        <span class="list-subtitle">{{ row.task.task_no }}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <a
+                      class="text-link url-cell"
+                      :href="row.sourceUrl"
+                      target="_blank"
+                      rel="noreferrer"
+                      :title="row.sourceUrl"
+                    >
+                      {{ truncateUrl(row.sourceUrl) }}
+                    </a>
+                  </td>
+                  <td>{{ getMarketplaceLabel(row.marketplace) }}</td>
+                  <td>
+                    <span class="status-pill" :data-status="row.task.status">
+                      {{ getStatusLabel(row.task.status) }}
+                    </span>
+                  </td>
+                  <td>{{ row.task.success_count }} / {{ row.task.total_count }}</td>
+                  <td>{{ formatDate(row.task.finished_at || row.task.created_at) }}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
-          <p>任务完成后，原始层直接生成 family + variants，不再写入单体 raw snapshot。</p>
-        </div>
+          <p v-else class="empty-state">还没有采集任务。</p>
+        </template>
 
-        <div class="table-wrap" v-if="state.collections.length">
-          <table>
-            <thead>
-              <tr>
-                <th>任务号</th>
-                <th>来源</th>
-                <th>站点</th>
-                <th>状态</th>
-                <th>成功 / 总数</th>
-                <th>完成时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="task in state.collections" :key="task.id">
-                <td>{{ task.task_no }}</td>
-                <td>{{ task.source_url }}</td>
-                <td>{{ getMarketplaceLabel(task.marketplace) }}</td>
-                <td>
-                  <span class="status-pill" :data-status="task.status">
-                    {{ getStatusLabel(task.status) }}
-                  </span>
-                </td>
-                <td>{{ task.success_count }} / {{ task.total_count }}</td>
-                <td>{{ formatDate(task.finished_at || task.created_at) }}</td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <p v-else class="empty-state">还没有采集任务。</p>
-      </section>
-
-      <section v-if="activeView === 'families'" class="panel-shell">
-        <div class="panel-header">
-          <div>
-            <p class="eyebrow">Families</p>
-            <h3>商品族列表</h3>
+        <template v-else-if="intakeTab === 'families' && !selectedFamily">
+          <div class="toolbar toolbar-compact">
+            <label class="toolbar-field grow">
+              <span>搜索商品族</span>
+              <input v-model="filters.familyQuery" type="text" placeholder="标题 / 品牌 / family key" />
+            </label>
+            <label class="toolbar-field">
+              <span>站点</span>
+              <select v-model="filters.familyMarketplace">
+                <option v-for="option in familyMarketplaceOptions" :key="option.value" :value="option.value">
+                  {{ option.label }}
+                </option>
+              </select>
+            </label>
           </div>
-          <p>每张卡代表一个 raw product family，卡内展开展示采集回来的原始变体。</p>
-        </div>
 
-        <div class="toolbar">
-          <label class="toolbar-field grow">
-            <span>搜索商品族</span>
-            <input v-model="filters.familyQuery" type="text" placeholder="标题 / 品牌 / family key" />
-          </label>
-          <label class="toolbar-field">
-            <span>站点</span>
-            <select v-model="filters.familyMarketplace">
-              <option v-for="option in familyMarketplaceOptions" :key="option.value" :value="option.value">
-                {{ option.label }}
-              </option>
-            </select>
-          </label>
-        </div>
+          <div class="table-wrap list-table" v-if="filteredFamilies.length">
+            <table>
+              <thead>
+                <tr>
+                  <th class="col-product">商品</th>
+                  <th>采集链接</th>
+                  <th>站点</th>
+                  <th>状态</th>
+                  <th>变体数</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="family in filteredFamilies" :key="family.id">
+                  <td>
+                    <div class="list-product-cell">
+                      <div class="list-thumb" :class="{ placeholder: !getFamilyImage(family) }">
+                        <img v-if="getFamilyImage(family)" :src="getFamilyImage(family)" :alt="family.title || 'family'" />
+                        <span v-else>无图</span>
+                      </div>
+                      <div class="list-product-copy">
+                        <strong class="list-title">{{ family.title || "未命名商品族" }}</strong>
+                        <span class="list-subtitle">{{ family.brand || "品牌待补充" }} · {{ familyLeadPrice(family) }}</span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <a
+                      v-if="family.source_url"
+                      class="text-link url-cell"
+                      :href="family.source_url"
+                      target="_blank"
+                      rel="noreferrer"
+                      :title="family.source_url"
+                    >
+                      {{ truncateUrl(family.source_url) }}
+                    </a>
+                    <span v-else>—</span>
+                  </td>
+                  <td>{{ getMarketplaceLabel(family.marketplace) }}</td>
+                  <td>
+                    <span class="status-pill" :data-status="getFamilyStatusKey(family)">
+                      {{ getFamilyStatusLabel(family) }}
+                    </span>
+                  </td>
+                  <td>{{ family.variant_count }}</td>
+                  <td>
+                    <div class="list-actions">
+                      <button type="button" class="secondary-button inline-button" @click="openFamilyDetail(family.id)">
+                        查看详情
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-button"
+                        :disabled="Boolean(family.selection_id)"
+                        @click="addToSelection(family.id)"
+                      >
+                        {{ family.selection_id ? "已入选" : "加入选品" }}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="empty-state">当前没有匹配的商品族。</p>
+        </template>
 
-        <div class="catalog-grid" v-if="filteredFamilies.length">
-          <article v-for="family in filteredFamilies" :key="family.id" class="catalog-card">
-            <div class="catalog-media">
-              <span class="market-badge">{{ getMarketplaceLabel(family.marketplace) }}</span>
+        <div v-else-if="intakeTab === 'families'" class="detail-panel">
+          <button type="button" class="secondary-button back-button" @click="closeFamilyDetail">返回列表</button>
+
+          <div class="detail-hero">
+            <div class="list-thumb detail-thumb" :class="{ placeholder: !getFamilyImage(selectedFamily) }">
               <img
-                class="catalog-thumb"
-                :src="family.main_image_url || family.variants[0]?.main_image_url || ''"
-                :alt="family.title || 'family image'"
+                v-if="getFamilyImage(selectedFamily)"
+                :src="getFamilyImage(selectedFamily)"
+                :alt="selectedFamily.title || 'family'"
               />
+              <span v-else>无图</span>
             </div>
-
-            <div class="catalog-body">
-              <h4>{{ family.title || "未命名商品族" }}</h4>
+            <div class="detail-hero-copy">
+              <h4>{{ selectedFamily.title || "未命名商品族" }}</h4>
               <div class="meta-line compact">
-                <span>{{ family.brand || "品牌待补充" }}</span>
-                <span>{{ familyLeadPrice(family) }}</span>
-                <span>{{ family.variant_count }} 个变体</span>
-                <span v-if="family.rating">{{ family.rating }}</span>
+                <span>{{ selectedFamily.brand || "品牌待补充" }}</span>
+                <span>{{ getMarketplaceLabel(selectedFamily.marketplace) }}</span>
+                <span>{{ familyLeadPrice(selectedFamily) }}</span>
+                <span v-if="selectedFamily.rating">{{ selectedFamily.rating }}</span>
+                <span v-if="selectedFamily.review_count">{{ selectedFamily.review_count }}</span>
               </div>
-
               <div class="tag-row">
-                <span v-for="dimension in family.variant_dimensions || []" :key="dimension" class="tag-chip">
+                <span v-for="dimension in selectedFamily.variant_dimensions || []" :key="dimension" class="tag-chip">
                   {{ dimension }}
                 </span>
               </div>
-
               <div class="card-actions">
-                <span v-if="family.selection_status" class="status-pill" :data-status="family.selection_status">
-                  {{ getStatusLabel(family.selection_status) }}
+                <span class="status-pill" :data-status="getFamilyStatusKey(selectedFamily)">
+                  {{ getFamilyStatusLabel(selectedFamily) }}
                 </span>
-                <span v-if="family.product_master_id" class="status-pill" data-status="converted">已生成 SPU</span>
+                <a
+                  v-if="selectedFamily.source_url"
+                  class="text-link"
+                  :href="selectedFamily.source_url"
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  打开采集链接
+                </a>
                 <button
                   type="button"
                   class="inline-button"
-                  :disabled="Boolean(family.selection_id)"
-                  @click="addToSelection(family.id)"
+                  :disabled="Boolean(selectedFamily.selection_id)"
+                  @click="addToSelection(selectedFamily.id)"
                 >
-                  {{ family.selection_id ? "已加入选品池" : "加入选品池" }}
+                  {{ selectedFamily.selection_id ? "已加入选品池" : "加入选品池" }}
                 </button>
-                <button
-                  type="button"
-                  class="secondary-button inline-button"
-                  @click="familyExpandedState[family.id] = !familyExpandedState[family.id]"
-                >
-                  {{ familyExpandedState[family.id] ? "收起变体" : "展开变体" }}
-                </button>
-              </div>
-
-              <div v-if="familyExpandedState[family.id]" class="variant-stack">
-                <article v-for="variant in family.variants" :key="variant.id" class="variant-row">
-                  <div>
-                    <strong>{{ variant.asin || "无 ASIN" }}</strong>
-                    <p class="cell-copy">{{ variantPreview(variant) }}</p>
-                  </div>
-                  <div class="variant-meta">
-                    <span>{{ variant.price_text || "价格待补充" }}</span>
-                    <span v-if="variant.source_url">
-                      <a class="text-link" :href="variant.source_url" target="_blank" rel="noreferrer">查看链接</a>
-                    </span>
-                  </div>
-                </article>
               </div>
             </div>
-          </article>
+          </div>
+
+          <div v-if="selectedFamily.bullet_points?.length" class="detail-block">
+            <h5>五点描述</h5>
+            <ul class="bullet-preview">
+              <li v-for="bullet in selectedFamily.bullet_points" :key="bullet">{{ bullet }}</li>
+            </ul>
+          </div>
+
+          <div class="detail-block">
+            <div class="subpanel-head">
+              <h5>变体列表</h5>
+              <span>{{ selectedFamily.variant_count }} 个子类</span>
+            </div>
+            <div class="variant-card-list">
+              <article
+                v-for="variant in selectedFamily.variants"
+                :key="variant.id"
+                class="variant-card"
+                :class="{ expanded: isVariantExpanded(variant.id) }"
+              >
+                <div class="variant-card-head">
+                  <div class="variant-card-media">
+                    <img
+                      v-if="getVariantImage(variant)"
+                      :src="getVariantImage(variant)"
+                      :alt="getVariantTitle(variant, selectedFamily)"
+                    />
+                    <span v-else class="variant-card-placeholder">无图</span>
+                  </div>
+
+                  <div class="variant-card-body">
+                    <div class="variant-card-line">
+                      <h6 class="variant-card-title">{{ getVariantTitle(variant, selectedFamily) }}</h6>
+                      <span class="spec-chip">{{ variantPreview(variant) }}</span>
+                      <span v-if="variant.asin" class="asin-chip">{{ variant.asin }}</span>
+                    </div>
+                  </div>
+
+                  <div class="variant-card-side">
+                    <strong class="variant-price-text">{{ variant.price_text || "—" }}</strong>
+                    <div class="variant-card-actions">
+                      <button
+                        type="button"
+                        class="ghost-button"
+                        :class="{ active: isVariantExpanded(variant.id) }"
+                        @click="toggleVariantDetail(variant.id)"
+                      >
+                        {{ isVariantExpanded(variant.id) ? "收起" : "详情" }}
+                      </button>
+                      <a
+                        v-if="variant.source_url"
+                        class="ghost-button ghost-link"
+                        :href="variant.source_url"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Amazon
+                      </a>
+                    </div>
+                  </div>
+                </div>
+
+                <div v-if="isVariantExpanded(variant.id)" class="variant-card-detail">
+                  <div class="variant-detail-meta">
+                    <div v-if="variant.parent_asin" class="variant-meta-item">
+                      <span>Parent ASIN</span>
+                      <strong>{{ variant.parent_asin }}</strong>
+                    </div>
+                    <div v-if="variant.snapshot_time" class="variant-meta-item">
+                      <span>采集时间</span>
+                      <strong>{{ formatDate(variant.snapshot_time) }}</strong>
+                    </div>
+                    <div v-if="variant.source_url" class="variant-meta-item variant-meta-item-wide">
+                      <span>采集链接</span>
+                      <a class="text-link" :href="variant.source_url" target="_blank" rel="noreferrer">
+                        {{ truncateUrl(variant.source_url, 80) }}
+                      </a>
+                    </div>
+                  </div>
+
+                  <div v-if="getVariantBulletPoints(variant, selectedFamily).length" class="variant-detail-section">
+                    <strong>五点描述</strong>
+                    <ul class="variant-bullet-list">
+                      <li v-for="bullet in getVariantBulletPoints(variant, selectedFamily)" :key="bullet">
+                        {{ bullet }}
+                      </li>
+                    </ul>
+                  </div>
+
+                  <div v-if="getVariantAttributeEntries(variant).length" class="variant-attr-grid">
+                    <article
+                      v-for="[key, value] in getVariantAttributeEntries(variant)"
+                      :key="`${variant.id}-${key}`"
+                    >
+                      <span>{{ key }}</span>
+                      <strong>{{ value }}</strong>
+                    </article>
+                  </div>
+                </div>
+              </article>
+            </div>
+          </div>
         </div>
-        <p v-else class="empty-state">当前没有匹配的商品族。</p>
       </section>
 
       <section v-if="activeView === 'selections'" class="panel-shell">
         <div class="panel-header">
           <div>
             <p class="eyebrow">Selections</p>
-            <h3>选品池与变体范围</h3>
+            <h3>{{ selectedSelection ? "选品详情" : "选品池列表" }}</h3>
           </div>
-          <p>创建 selection 后默认包含全部变体。这里可以缩小范围，再生成 SPU 和多 SKU。</p>
+          <p>
+            {{
+              selectedSelection
+                ? "调整变体范围后保存，再生成 SPU 和多 SKU。"
+                : "列表浏览已选商品族，进入详情可管理变体范围。"
+            }}
+          </p>
         </div>
 
-        <div class="toolbar">
-          <label class="toolbar-field grow">
-            <span>搜索选品</span>
-            <input v-model="filters.selectionQuery" type="text" placeholder="标题 / 品牌 / family key" />
-          </label>
-        </div>
+        <template v-if="!selectedSelection">
+          <div class="toolbar toolbar-compact">
+            <label class="toolbar-field grow">
+              <span>搜索选品</span>
+              <input v-model="filters.selectionQuery" type="text" placeholder="标题 / 品牌 / family key" />
+            </label>
+          </div>
 
-        <div class="stack-list" v-if="filteredSelections.length">
-          <article v-for="selection in filteredSelections" :key="selection.id" class="task-card">
-            <div class="row-head">
-              <div>
-                <strong>{{ selection.family_title || "未命名商品族" }}</strong>
-                <p class="hint-text">
-                  {{ selection.family_brand || "品牌待补充" }} ·
-                  {{ getMarketplaceLabel(selection.family_marketplace) }} ·
-                  {{ selectionLeadPrice(selection) }} ·
-                  {{ selectionCoverage(selection) }}
-                </p>
+          <div class="table-wrap list-table" v-if="filteredSelections.length">
+            <table>
+              <thead>
+                <tr>
+                  <th class="col-product">商品</th>
+                  <th>采集链接</th>
+                  <th>站点</th>
+                  <th>状态</th>
+                  <th>变体范围</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="selection in filteredSelections" :key="selection.id">
+                  <td>
+                    <div class="list-product-cell">
+                      <div class="list-thumb" :class="{ placeholder: !getFamilyImage(selection) }">
+                        <img
+                          v-if="getFamilyImage(selection)"
+                          :src="getFamilyImage(selection)"
+                          :alt="selection.family_title || 'selection'"
+                        />
+                        <span v-else>无图</span>
+                      </div>
+                      <div class="list-product-copy">
+                        <strong class="list-title">{{ selection.family_title || "未命名商品族" }}</strong>
+                        <span class="list-subtitle">
+                          {{ selection.family_brand || "品牌待补充" }} · {{ selectionLeadPrice(selection) }}
+                        </span>
+                      </div>
+                    </div>
+                  </td>
+                  <td>
+                    <a
+                      v-if="selection.family_source_url"
+                      class="text-link url-cell"
+                      :href="selection.family_source_url"
+                      target="_blank"
+                      rel="noreferrer"
+                      :title="selection.family_source_url"
+                    >
+                      {{ truncateUrl(selection.family_source_url) }}
+                    </a>
+                    <span v-else>—</span>
+                  </td>
+                  <td>{{ getMarketplaceLabel(selection.family_marketplace) }}</td>
+                  <td>
+                    <span class="status-pill" :data-status="selection.selection_status">
+                      {{ getStatusLabel(selection.selection_status) }}
+                    </span>
+                  </td>
+                  <td>{{ selectionCoverage(selection) }}</td>
+                  <td>
+                    <div class="list-actions">
+                      <button type="button" class="secondary-button inline-button" @click="openSelectionDetail(selection.id)">
+                        查看详情
+                      </button>
+                      <button
+                        type="button"
+                        class="inline-button"
+                        :disabled="selection.selection_status === 'converted'"
+                        @click="createProduct(selection.id)"
+                      >
+                        {{ selection.selection_status === "converted" ? "已建档" : "生成 SPU" }}
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="empty-state">选品池为空，先去商品族列表加入候选。</p>
+        </template>
+
+        <div v-else class="detail-panel">
+          <button type="button" class="secondary-button back-button" @click="closeSelectionDetail">返回列表</button>
+
+          <div class="detail-hero">
+            <div class="list-thumb detail-thumb" :class="{ placeholder: !getFamilyImage(selectedSelection) }">
+              <img
+                v-if="getFamilyImage(selectedSelection)"
+                :src="getFamilyImage(selectedSelection)"
+                :alt="selectedSelection.family_title || 'selection'"
+              />
+              <span v-else>无图</span>
+            </div>
+            <div class="detail-hero-copy">
+              <h4>{{ selectedSelection.family_title || "未命名商品族" }}</h4>
+              <div class="meta-line compact">
+                <span>{{ selectedSelection.family_brand || "品牌待补充" }}</span>
+                <span>{{ getMarketplaceLabel(selectedSelection.family_marketplace) }}</span>
+                <span>{{ selectionLeadPrice(selectedSelection) }}</span>
+                <span>{{ selectionCoverage(selectedSelection) }}</span>
               </div>
-              <span class="status-pill" :data-status="selection.selection_status">
-                {{ getStatusLabel(selection.selection_status) }}
-              </span>
+              <div class="card-actions">
+                <span class="status-pill" :data-status="selectedSelection.selection_status">
+                  {{ getStatusLabel(selectedSelection.selection_status) }}
+                </span>
+                <button type="button" class="inline-button" @click="saveSelectionScope(selectedSelection.id)">
+                  保存变体范围
+                </button>
+                <button
+                  type="button"
+                  class="inline-button"
+                  :disabled="selectedSelection.selection_status === 'converted'"
+                  @click="createProduct(selectedSelection.id)"
+                >
+                  {{ selectedSelection.selection_status === "converted" ? "已建档" : "生成 SPU + SKU" }}
+                </button>
+              </div>
             </div>
+          </div>
 
-            <div class="card-actions">
-              <button
-                type="button"
-                class="secondary-button inline-button"
-                @click="selectionExpandedState[selection.id] = !selectionExpandedState[selection.id]"
-              >
-                {{ selectionExpandedState[selection.id] ? "收起变体" : "展开变体" }}
-              </button>
-              <button type="button" class="inline-button" @click="saveSelectionScope(selection.id)">
-                保存变体范围
-              </button>
-              <button
-                type="button"
-                class="inline-button"
-                :disabled="selection.selection_status === 'converted'"
-                @click="createProduct(selection.id)"
-              >
-                {{ selection.selection_status === "converted" ? "已建档" : "生成 SPU + SKU" }}
-              </button>
+          <div class="detail-block">
+            <div class="subpanel-head">
+              <h5>变体范围</h5>
+              <span>勾选需要纳入建档的变体，点击详情查看完整信息</span>
             </div>
-
-            <div v-if="selectionExpandedState[selection.id]" class="variant-stack">
-              <label
-                v-for="variant in selection.variants"
+            <div class="variant-card-list">
+              <article
+                v-for="variant in selectedSelection.variants"
                 :key="variant.id"
-                class="variant-row selector-row"
+                class="variant-card variant-card-selectable"
+                :class="{
+                  expanded: isVariantExpanded(variant.id),
+                  selected: isVariantSelected(selectedSelection.id, variant.id),
+                }"
               >
-                <div class="selector-main">
-                  <input
-                    type="checkbox"
-                    :checked="isVariantSelected(selection.id, variant.id)"
-                    @change="toggleVariantInScope(selection.id, variant.id)"
-                  />
-                  <div>
-                    <strong>{{ variant.asin || "无 ASIN" }}</strong>
-                    <p class="cell-copy">{{ variantPreview(variant) }}</p>
+                <div class="variant-card-head">
+                  <label class="variant-select-check" @click.stop>
+                    <input
+                      type="checkbox"
+                      :checked="isVariantSelected(selectedSelection.id, variant.id)"
+                      @change="toggleVariantInScope(selectedSelection.id, variant.id)"
+                    />
+                  </label>
+
+                  <div class="variant-card-media">
+                    <img
+                      v-if="getVariantImage(variant)"
+                      :src="getVariantImage(variant)"
+                      :alt="getVariantTitle(variant, selectedSelectionFamily)"
+                    />
+                    <span v-else class="variant-card-placeholder">无图</span>
+                  </div>
+
+                  <div class="variant-card-body">
+                    <div class="variant-card-line">
+                      <h6 class="variant-card-title">
+                        {{ getVariantTitle(variant, selectedSelectionFamily) }}
+                      </h6>
+                      <span class="spec-chip">{{ variantPreview(variant) }}</span>
+                      <span v-if="variant.asin" class="asin-chip">{{ variant.asin }}</span>
+                    </div>
+                  </div>
+
+                  <div class="variant-card-side">
+                    <strong class="variant-price-text">{{ variant.price_text || "—" }}</strong>
+                    <div class="variant-card-actions">
+                      <button
+                        type="button"
+                        class="ghost-button"
+                        :class="{ active: isVariantExpanded(variant.id) }"
+                        @click="toggleVariantDetail(variant.id)"
+                      >
+                        {{ isVariantExpanded(variant.id) ? "收起" : "详情" }}
+                      </button>
+                      <a
+                        v-if="variant.source_url"
+                        class="ghost-button ghost-link"
+                        :href="variant.source_url"
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Amazon
+                      </a>
+                    </div>
                   </div>
                 </div>
-                <div class="variant-meta">
-                  <span>{{ variant.price_text || "价格待补充" }}</span>
-                </div>
-              </label>
-            </div>
-          </article>
-        </div>
-        <p v-else class="empty-state">选品池为空，先去商品族列表加入候选。</p>
-      </section>
 
-      <section v-if="activeView === 'products'" class="panel-shell">
-        <div class="panel-header">
-          <div>
-            <p class="eyebrow">Products</p>
-            <h3>SPU 与多 SKU 建档结果</h3>
-          </div>
-          <p>每个 product master 来自一个 family 级 selection，其下 SKU 来自当前 variant scope。</p>
-        </div>
+                <div v-if="isVariantExpanded(variant.id)" class="variant-card-detail">
+                  <div class="variant-detail-meta">
+                    <div v-if="variant.parent_asin" class="variant-meta-item">
+                      <span>Parent ASIN</span>
+                      <strong>{{ variant.parent_asin }}</strong>
+                    </div>
+                    <div v-if="variant.snapshot_time" class="variant-meta-item">
+                      <span>采集时间</span>
+                      <strong>{{ formatDate(variant.snapshot_time) }}</strong>
+                    </div>
+                    <div v-if="variant.source_url" class="variant-meta-item variant-meta-item-wide">
+                      <span>采集链接</span>
+                      <a class="text-link" :href="variant.source_url" target="_blank" rel="noreferrer">
+                        {{ truncateUrl(variant.source_url, 80) }}
+                      </a>
+                    </div>
+                  </div>
 
-        <div class="toolbar">
-          <label class="toolbar-field grow">
-            <span>搜索商品</span>
-            <input v-model="filters.productQuery" type="text" placeholder="SPU / 商品名 / 品牌" />
-          </label>
-        </div>
+                  <div
+                    v-if="selectedSelectionFamily && getVariantBulletPoints(variant, selectedSelectionFamily).length"
+                    class="variant-detail-section"
+                  >
+                    <strong>五点描述</strong>
+                    <ul class="variant-bullet-list">
+                      <li
+                        v-for="bullet in getVariantBulletPoints(variant, selectedSelectionFamily)"
+                        :key="bullet"
+                      >
+                        {{ bullet }}
+                      </li>
+                    </ul>
+                  </div>
 
-        <div class="product-grid" v-if="filteredProducts.length">
-          <article v-for="product in filteredProducts" :key="product.id" class="product-panel">
-            <div class="product-head">
-              <div>
-                <p class="mini-code">{{ product.spu_code }}</p>
-                <h4>{{ product.product_name }}</h4>
-              </div>
-              <span class="status-pill" :data-status="product.status">
-                {{ getStatusLabel(product.status) }}
-              </span>
-            </div>
-
-            <img
-              v-if="product.family_main_image_url"
-              class="catalog-thumb"
-              :src="product.family_main_image_url"
-              :alt="product.product_name"
-            />
-
-            <div class="meta-line">
-              <span>{{ product.brand || "品牌待补充" }}</span>
-              <span>{{ getMarketplaceLabel(product.target_marketplace) }}</span>
-              <span>{{ product.variants.length }} 个 SKU</span>
-              <span>默认成本 {{ formatNumber(product.default_cost) }}</span>
-            </div>
-
-            <div class="variant-stack">
-              <article v-for="variant in product.variants" :key="variant.id" class="variant-row">
-                <div>
-                  <strong>{{ variant.sku }}</strong>
-                  <p class="cell-copy">{{ variantPreview(variant) }}</p>
-                </div>
-                <div class="variant-meta">
-                  <span>{{ variant.raw_asin || "-" }}</span>
-                  <span>成本 {{ formatNumber(variant.cost_price) }}</span>
-                  <span>库存 {{ variant.stock_qty }}</span>
+                  <div v-if="getVariantAttributeEntries(variant).length" class="variant-attr-grid">
+                    <article
+                      v-for="[key, value] in getVariantAttributeEntries(variant)"
+                      :key="`${variant.id}-${key}`"
+                    >
+                      <span>{{ key }}</span>
+                      <strong>{{ value }}</strong>
+                    </article>
+                  </div>
                 </div>
               </article>
             </div>
-
-            <div class="card-actions">
-              <button type="button" class="inline-button" @click="createDraft(product.id)">
-                生成 Listing 草稿
-              </button>
-            </div>
-          </article>
+          </div>
         </div>
-        <p v-else class="empty-state">还没有商品主档。</p>
       </section>
 
-      <section v-if="activeView === 'drafts'" class="panel-shell">
+      <section v-if="activeView === 'listing'" class="panel-shell">
         <div class="panel-header">
           <div>
-            <p class="eyebrow">Drafts</p>
-            <h3>Listing 草稿编辑</h3>
+            <p class="eyebrow">Listing</p>
+            <h3>Listing 工作台</h3>
           </div>
-          <p>草稿层沿用多 SKU 结构，文案统一编辑，价格库存按 SKU 单独维护。</p>
+          <p>以 SPU 为主查看建档结果，在同一页面创建和编辑 Listing 草稿。</p>
         </div>
 
-        <div class="toolbar">
-          <label class="toolbar-field grow">
-            <span>搜索草稿</span>
-            <input v-model="filters.draftQuery" type="text" placeholder="商品名 / SPU / 店铺 / 站点" />
+        <div class="action-bar action-bar-muted">
+          <label class="action-bar-field">
+            <span>店铺名</span>
+            <input v-model="defaultShopName" type="text" />
+          </label>
+          <label class="action-bar-field">
+            <span>站点</span>
+            <input v-model="defaultMarketplace" type="text" />
           </label>
         </div>
 
-        <div v-if="filteredDrafts.length" class="draft-layout">
-          <aside class="draft-sidebar">
-            <button
-              v-for="draft in filteredDrafts"
-              :key="draft.id"
-              type="button"
-              class="draft-nav-card"
-              :class="{ active: selectedDraftId === draft.id }"
-              @click="selectedDraftId = draft.id"
-            >
-              <strong>{{ draft.product_name }}</strong>
-              <span>{{ getMarketplaceLabel(draft.marketplace) }}</span>
-              <small>{{ draft.shop_name }} · V{{ draft.current_version_no }}</small>
-            </button>
-          </aside>
+        <div class="toolbar toolbar-compact">
+          <label class="toolbar-field grow">
+            <span>搜索 SPU / 草稿</span>
+            <input v-model="filters.listingQuery" type="text" placeholder="SPU / 商品名 / 店铺 / 站点 / 标题" />
+          </label>
+        </div>
 
-          <div v-if="selectedDraft" class="draft-main">
+        <div class="table-wrap list-table" v-if="filteredListingProducts.length">
+          <table>
+            <thead>
+              <tr>
+                <th class="col-product">商品</th>
+                <th>SPU</th>
+                <th>站点</th>
+                <th>状态</th>
+                <th>SKU 数</th>
+                <th>草稿</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="product in filteredListingProducts"
+                :key="product.id"
+                :class="{ 'row-active': selectedDraft?.product_master_id === product.id }"
+              >
+                <td>
+                  <div class="list-product-cell">
+                    <div class="list-thumb" :class="{ placeholder: !product.family_main_image_url }">
+                      <img
+                        v-if="product.family_main_image_url"
+                        :src="product.family_main_image_url"
+                        :alt="product.product_name"
+                      />
+                      <span v-else>无图</span>
+                    </div>
+                    <div class="list-product-copy">
+                      <strong class="list-title">{{ product.product_name }}</strong>
+                      <span class="list-subtitle">{{ product.brand || "品牌待补充" }}</span>
+                    </div>
+                  </div>
+                </td>
+                <td>{{ product.spu_code }}</td>
+                <td>{{ getMarketplaceLabel(product.target_marketplace) }}</td>
+                <td>
+                  <span class="status-pill" :data-status="product.status">
+                    {{ getStatusLabel(product.status) }}
+                  </span>
+                </td>
+                <td>{{ product.variants.length }}</td>
+                <td>{{ getDraftsForProduct(product.id).length }}</td>
+                <td>
+                  <button
+                    v-if="getDraftsForProduct(product.id).length"
+                    type="button"
+                    class="secondary-button inline-button"
+                    @click="openListingForProduct(product.id)"
+                  >
+                    编辑草稿
+                  </button>
+                  <button v-else type="button" class="inline-button" @click="createDraft(product.id)">
+                    生成草稿
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+        <p v-else class="empty-state">还没有商品主档，请先从选品池建档。</p>
+
+        <div
+          v-if="selectedDraft && getDraftsForProduct(selectedDraft.product_master_id).length > 1"
+          class="module-tabs module-tabs-inline"
+        >
+          <button
+            v-for="draft in getDraftsForProduct(selectedDraft.product_master_id)"
+            :key="draft.id"
+            type="button"
+            class="module-tab"
+            :class="{ active: selectedDraftId === draft.id }"
+            @click="openDraftEditor(draft.id)"
+          >
+            {{ draft.shop_name }} · V{{ draft.current_version_no }}
+          </button>
+        </div>
+
+        <div v-if="selectedDraft" class="draft-main draft-main-below">
             <div class="draft-top-grid">
               <div class="draft-header-card">
                 <div>
@@ -1321,87 +1877,107 @@ async function withLoading(action: () => Promise<void>): Promise<void> {
               </div>
             </div>
           </div>
-        </div>
-        <p v-else class="empty-state">还没有草稿，先从商品中心创建一个。</p>
       </section>
 
       <section v-if="activeView === 'publish'" class="panel-shell">
         <div class="panel-header">
           <div>
             <p class="eyebrow">Publish</p>
-            <h3>发布任务与 Live SKU</h3>
+            <h3>发布中心列表</h3>
           </div>
-          <p>这里展示模拟发布结果和已回写的 SKU 状态。</p>
+          <p>发布任务与已回写 Live SKU 均以列表展示。</p>
         </div>
 
-        <div class="grid-two">
-          <article class="subpanel">
-            <div class="subpanel-head">
-              <h4>发布任务</h4>
-              <span>{{ state.publishTasks.length }} 条</span>
-            </div>
-            <div v-if="state.publishTasks.length" class="stack-list">
-              <article v-for="task in state.publishTasks" :key="task.id" class="task-card publish-card">
-                <div class="row-head">
-                  <strong>{{ task.task_no }}</strong>
-                  <span class="status-pill" :data-status="task.status">
-                    {{ getStatusLabel(task.status) }}
-                  </span>
-                </div>
-                <div class="meta-line">
-                  <span>{{ task.shop_name || "-" }}</span>
-                  <span>{{ getMarketplaceLabel(task.marketplace) }}</span>
-                  <span>{{ task.success_count }}/{{ task.total_count }} 成功</span>
-                </div>
-                <ul class="issue-list">
-                  <li v-for="item in task.items.slice(0, 3)" :key="item.id">
-                    <strong>{{ item.seller_sku }}</strong>
-                    <span>{{ getStatusLabel(item.status) }}</span>
-                    <span v-if="item.error_message"> · {{ item.error_message }}</span>
-                  </li>
-                </ul>
-              </article>
-            </div>
-            <p v-else class="empty-state">还没有发布任务。</p>
-          </article>
+        <div class="action-bar action-bar-muted">
+          <label class="action-bar-field">
+            <span>店铺名</span>
+            <input v-model="defaultShopName" type="text" />
+          </label>
+          <label class="action-bar-field">
+            <span>站点</span>
+            <input v-model="defaultMarketplace" type="text" />
+          </label>
+        </div>
 
-          <article class="subpanel">
-            <div class="subpanel-head">
-              <h4>Live SKU</h4>
-              <span>{{ state.liveListings.length }} 条</span>
-            </div>
-            <div v-if="state.liveListings.length" class="table-wrap slim">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Seller SKU</th>
-                    <th>状态</th>
-                    <th>站点</th>
-                    <th>价格</th>
-                    <th>库存</th>
-                    <th>更新时间</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  <tr v-for="item in state.liveListings" :key="item.id">
-                    <td>{{ item.seller_sku }}</td>
-                    <td>
-                      <span class="status-pill" :data-status="item.listing_status">
-                        {{ getStatusLabel(item.listing_status) }}
-                      </span>
-                    </td>
-                    <td>{{ getMarketplaceLabel(item.marketplace) }}</td>
-                    <td>{{ formatNumber(item.price) }}</td>
-                    <td>{{ item.quantity }}</td>
-                    <td>{{ formatDate(item.updated_at) }}</td>
-                  </tr>
-                </tbody>
-              </table>
-            </div>
-            <p v-else class="empty-state">还没有已回写的 SKU 状态。</p>
-          </article>
+        <div class="detail-block">
+          <div class="subpanel-head">
+            <h4>发布任务</h4>
+            <span>{{ state.publishTasks.length }} 条</span>
+          </div>
+          <div class="table-wrap list-table" v-if="state.publishTasks.length">
+            <table>
+              <thead>
+                <tr>
+                  <th>任务号</th>
+                  <th>店铺</th>
+                  <th>站点</th>
+                  <th>类型</th>
+                  <th>状态</th>
+                  <th>成功 / 总数</th>
+                  <th>完成时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="task in state.publishTasks" :key="task.id">
+                  <td>{{ task.task_no }}</td>
+                  <td>{{ task.shop_name || "—" }}</td>
+                  <td>{{ getMarketplaceLabel(task.marketplace) }}</td>
+                  <td>{{ task.submit_type === "simulation" ? "模拟" : "手动" }}</td>
+                  <td>
+                    <span class="status-pill" :data-status="task.status">
+                      {{ getStatusLabel(task.status) }}
+                    </span>
+                  </td>
+                  <td>{{ task.success_count }} / {{ task.total_count }}</td>
+                  <td>{{ formatDate(task.finished_at || task.created_at) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="empty-state">还没有发布任务。</p>
+        </div>
+
+        <div class="detail-block">
+          <div class="subpanel-head">
+            <h4>Live SKU</h4>
+            <span>{{ state.liveListings.length }} 条</span>
+          </div>
+          <div class="table-wrap list-table" v-if="state.liveListings.length">
+            <table>
+              <thead>
+                <tr>
+                  <th>Seller SKU</th>
+                  <th>ASIN</th>
+                  <th>状态</th>
+                  <th>店铺</th>
+                  <th>站点</th>
+                  <th>价格</th>
+                  <th>库存</th>
+                  <th>更新时间</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="item in state.liveListings" :key="item.id">
+                  <td>{{ item.seller_sku }}</td>
+                  <td>{{ item.asin || "—" }}</td>
+                  <td>
+                    <span class="status-pill" :data-status="item.listing_status">
+                      {{ getStatusLabel(item.listing_status) }}
+                    </span>
+                  </td>
+                  <td>{{ item.shop_name }}</td>
+                  <td>{{ getMarketplaceLabel(item.marketplace) }}</td>
+                  <td>{{ formatNumber(item.price) }}</td>
+                  <td>{{ item.quantity }}</td>
+                  <td>{{ formatDate(item.updated_at) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p v-else class="empty-state">还没有已回写的 SKU 状态。</p>
         </div>
       </section>
+      </div>
     </main>
   </div>
 </template>
