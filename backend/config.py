@@ -17,7 +17,12 @@ def get_env(name: str, default: str | None = None) -> str:
 
 
 def get_port() -> int:
-    return int(get_env("PORT", "8000"))
+    return int(get_env("PORT", "3001"))
+
+
+def get_cors_origins() -> list[str]:
+    raw_value = get_env("CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173")
+    return [item.strip() for item in raw_value.split(",") if item.strip()]
 
 
 def get_db_config() -> dict[str, str | int]:
