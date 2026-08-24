@@ -40,36 +40,49 @@ const draftValidationItems = toRef(props, "draftValidationItems");
 
 const { variantPreview, getStatusLabel, getMarketplaceLabel, getDraftsForProduct } = props.helpers;
 const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishDraft, saveDraftVariant } = props.actions;
+
+function validationLevelLabel(level: string): string {
+  switch (level) {
+    case "pass":
+      return "通过";
+    case "warn":
+      return "警告";
+    case "fail":
+      return "未通过";
+    default:
+      return level;
+  }
+}
 </script>
 
 <template>
   <section class="panel-shell">
     <div class="panel-header">
       <div>
-        <p class="eyebrow">Listing</p>
-        <h3>SPU and Draft Workspace</h3>
+        <p class="eyebrow">草稿</p>
+        <h3>上架草稿</h3>
       </div>
-      <p>Create listing drafts from SPUs, edit copy, then complete SKU-level pricing and inventory.</p>
+      <p>编辑文案、价格与库存</p>
     </div>
 
     <div class="action-bar action-bar-muted">
       <label class="action-bar-field">
-        <span>Shop Name</span>
+        <span>店铺名称</span>
         <input v-model="defaultShopName" type="text" />
       </label>
       <label class="action-bar-field">
-        <span>Marketplace</span>
+        <span>站点</span>
         <input v-model="defaultMarketplace" type="text" />
       </label>
     </div>
 
     <div class="toolbar toolbar-compact">
       <label class="toolbar-field grow">
-        <span>Search SPUs or Drafts</span>
+        <span>搜索 SPU 或草稿</span>
         <input
           v-model="filters.listingQuery"
           type="text"
-          placeholder="SPU / product / shop / marketplace / title"
+          placeholder="SPU / 商品 / 店铺 / 站点 / 标题"
         />
       </label>
     </div>
@@ -78,13 +91,13 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
       <table>
         <thead>
           <tr>
-            <th class="col-product">Product</th>
+            <th class="col-product">商品</th>
             <th>SPU</th>
-            <th>Marketplace</th>
-            <th>Status</th>
-            <th>SKUs</th>
-            <th>Drafts</th>
-            <th>Action</th>
+            <th>站点</th>
+            <th>状态</th>
+            <th>SKU 数</th>
+            <th>草稿数</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -97,11 +110,11 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
               <div class="list-product-cell">
                 <div class="list-thumb" :class="{ placeholder: !product.family_main_image_url }">
                   <img v-if="product.family_main_image_url" :src="product.family_main_image_url" :alt="product.product_name" />
-                  <span v-else>No image</span>
+                  <span v-else>暂无图片</span>
                 </div>
                 <div class="list-product-copy">
                   <strong class="list-title">{{ product.product_name }}</strong>
-                  <span class="list-subtitle">{{ product.brand || "Brand pending" }}</span>
+                  <span class="list-subtitle">{{ product.brand || "品牌待定" }}</span>
                 </div>
               </div>
             </td>
@@ -121,17 +134,17 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
                 class="secondary-button inline-button"
                 @click="openListingForProduct(product.id)"
               >
-                Open Draft
+                打开草稿
               </button>
               <button v-else type="button" class="inline-button" @click="createDraft(product.id)">
-                Create Draft
+                创建草稿
               </button>
             </td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p v-else class="empty-state">No SPUs yet. Create one from the selection pool first.</p>
+    <p v-else class="empty-state">暂无 SPU，请先在选品中创建。</p>
 
     <div
       v-if="selectedDraft && getDraftsForProduct(selectedDraft.product_master_id).length > 1"
@@ -157,31 +170,31 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
             <h4>{{ selectedDraft.product_name }}</h4>
             <p class="hint-text">
               {{ selectedDraft.shop_name }} · {{ getMarketplaceLabel(selectedDraft.marketplace) }} ·
-              {{ selectedDraft.variants.length }} SKUs
+              {{ selectedDraft.variants.length }} 个 SKU
             </p>
           </div>
           <div class="editor-actions">
-            <button type="button" class="secondary-button" @click="saveDraft">Save Draft</button>
-            <button type="button" @click="publishDraft(selectedDraft.id)">Simulate Publish</button>
+            <button type="button" class="secondary-button" @click="saveDraft">保存草稿</button>
+            <button type="button" @click="publishDraft(selectedDraft.id)">模拟发布</button>
           </div>
         </div>
 
         <div class="draft-summary-card">
           <div class="summary-row">
-            <span>Status</span>
+            <span>状态</span>
             <strong>{{ getStatusLabel(draftEditor.status) }}</strong>
           </div>
           <div class="summary-metrics">
             <article>
-              <span>Total SKUs</span>
+              <span>SKU 总数</span>
               <strong>{{ draftStats.totalSkuCount }}</strong>
             </article>
             <article>
-              <span>Priced</span>
+              <span>已定价</span>
               <strong>{{ draftStats.pricedSkuCount }}</strong>
             </article>
             <article>
-              <span>In Stock</span>
+              <span>有库存</span>
               <strong>{{ draftStats.stockedSkuCount }}</strong>
             </article>
           </div>
@@ -191,32 +204,32 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
       <div class="draft-workspace">
         <div class="editor-card">
           <div class="subpanel-head">
-            <h4>Draft Copy</h4>
-            <span>Saving creates a new version</span>
+            <h4>草稿文案</h4>
+            <span>保存会生成新版本</span>
           </div>
           <div class="editor-grid">
             <label>
-              <span>Title</span>
+              <span>标题</span>
               <input v-model="draftEditor.title" type="text" />
             </label>
             <label>
-              <span>Status</span>
+              <span>状态</span>
               <select v-model="draftEditor.status">
-                <option value="draft">Draft</option>
-                <option value="reviewing">Reviewing</option>
-                <option value="ready">Ready</option>
+                <option value="draft">草稿</option>
+                <option value="reviewing">审核中</option>
+                <option value="ready">待发布</option>
               </select>
             </label>
             <label class="full-span">
-              <span>Bullet Points</span>
+              <span>五点描述</span>
               <textarea v-model="draftEditor.bulletText" rows="6" />
             </label>
             <label class="full-span">
-              <span>Description</span>
+              <span>商品描述</span>
               <textarea v-model="draftEditor.description" rows="5" />
             </label>
             <label class="full-span">
-              <span>Search Terms</span>
+              <span>搜索词</span>
               <textarea v-model="draftEditor.searchTerms" rows="3" />
             </label>
           </div>
@@ -225,8 +238,8 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
         <div class="draft-side-stack">
           <article class="editor-card">
             <div class="subpanel-head">
-              <h4>Validation</h4>
-              <span>{{ draftValidationItems.length }} checks</span>
+              <h4>校验</h4>
+              <span>{{ draftValidationItems.length }} 项检查</span>
             </div>
             <div class="validation-list">
               <article
@@ -237,7 +250,7 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
               >
                 <div class="validation-head">
                   <strong>{{ item.label }}</strong>
-                  <span>{{ item.level }}</span>
+                  <span>{{ validationLevelLabel(item.level) }}</span>
                 </div>
                 <p>{{ item.detail }}</p>
               </article>
@@ -246,22 +259,22 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
 
           <article class="editor-card">
             <div class="subpanel-head">
-              <h4>Preview</h4>
-              <span>Draft snapshot</span>
+              <h4>预览</h4>
+              <span>草稿快照</span>
             </div>
             <div class="preview-card">
               <p class="preview-shop">{{ defaultShopName }} · {{ getMarketplaceLabel(selectedDraft.marketplace) }}</p>
-              <h5>{{ draftEditor.title || "Draft title preview" }}</h5>
+              <h5>{{ draftEditor.title || "标题预览" }}</h5>
               <div class="preview-meta">
-                <span>{{ draftStats.totalSkuCount }} SKUs</span>
-                <span>{{ draftStats.pricedSkuCount }} priced</span>
-                <span>{{ draftStats.stockedSkuCount }} stocked</span>
+                <span>{{ draftStats.totalSkuCount }} 个 SKU</span>
+                <span>{{ draftStats.pricedSkuCount }} 已定价</span>
+                <span>{{ draftStats.stockedSkuCount }} 有库存</span>
               </div>
               <ul class="preview-bullets">
                 <li v-for="bullet in draftPreviewBullets.slice(0, 5)" :key="bullet">{{ bullet }}</li>
               </ul>
               <p class="preview-description">
-                {{ draftEditor.description || "Description preview appears here." }}
+                {{ draftEditor.description || "商品描述预览将显示在这里。" }}
               </p>
             </div>
           </article>
@@ -270,20 +283,20 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
 
       <div class="editor-card">
         <div class="subpanel-head">
-          <h4>SKU Parameters</h4>
-          <span>{{ selectedDraft.variants.length }} records</span>
+          <h4>SKU 参数</h4>
+          <span>{{ selectedDraft.variants.length }} 条记录</span>
         </div>
         <div class="table-wrap">
           <table>
             <thead>
               <tr>
-                <th>Seller SKU</th>
-                <th>Variant</th>
-                <th>Price</th>
-                <th>Quantity</th>
-                <th>Fulfillment</th>
-                <th>External ID</th>
-                <th>Save</th>
+                <th>卖家 SKU</th>
+                <th>变体</th>
+                <th>价格</th>
+                <th>库存</th>
+                <th>履约方式</th>
+                <th>外部编码</th>
+                <th>保存</th>
               </tr>
             </thead>
             <tbody>
@@ -300,7 +313,7 @@ const { createDraft, openListingForProduct, openDraftEditor, saveDraft, publishD
                 </td>
                 <td><input v-model="variant.external_product_id" type="text" placeholder="UPC / EAN / GTIN" /></td>
                 <td>
-                  <button type="button" class="inline-button" @click="saveDraftVariant(variant)">Save</button>
+                  <button type="button" class="inline-button" @click="saveDraftVariant(variant)">保存</button>
                 </td>
               </tr>
             </tbody>

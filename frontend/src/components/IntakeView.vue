@@ -50,25 +50,21 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
   <section class="panel-shell">
     <div class="panel-header">
       <div>
-        <p class="eyebrow">Intake</p>
-        <h3>{{ selectedFamily && intakeTab === "families" ? "Family Detail" : "Collection Intake" }}</h3>
+        <p class="eyebrow">采集</p>
+        <h3>{{ selectedFamily && intakeTab === "families" ? "商品族详情" : "采集入口" }}</h3>
       </div>
       <p>
-        {{
-          selectedFamily && intakeTab === "families"
-            ? "Inspect a raw family and review all collected variants."
-            : "Submit collection URLs, review task history, and browse raw product families."
-        }}
+        {{ selectedFamily && intakeTab === "families" ? "查看变体明细" : "提交链接，查看任务与商品族" }}
       </p>
     </div>
 
     <div class="action-bar">
       <label class="action-bar-field grow">
-        <span>Amazon URL</span>
+        <span>Amazon 链接</span>
         <input v-model="collectionUrl" type="text" placeholder="https://www.amazon.com/dp/..." />
       </label>
       <button type="button" class="action-bar-button" :disabled="loading" @click="submitCollection">
-        {{ loading ? "Submitting..." : "Start Collection" }}
+        {{ loading ? "提交中..." : "开始采集" }}
       </button>
     </div>
 
@@ -79,7 +75,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
         :class="{ active: intakeTab === 'families' }"
         @click="intakeTab = 'families'"
       >
-        Families
+        商品族
       </button>
       <button
         type="button"
@@ -87,7 +83,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
         :class="{ active: intakeTab === 'tasks' }"
         @click="intakeTab = 'tasks'"
       >
-        Tasks
+        任务
       </button>
     </div>
 
@@ -96,12 +92,12 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
         <table>
           <thead>
             <tr>
-              <th class="col-product">Product</th>
-              <th>Source URL</th>
-              <th>Marketplace</th>
-              <th>Status</th>
-              <th>Success / Total</th>
-              <th>Completed At</th>
+              <th class="col-product">商品</th>
+              <th>来源链接</th>
+              <th>站点</th>
+              <th>状态</th>
+              <th>成功 / 总计</th>
+              <th>完成时间</th>
             </tr>
           </thead>
           <tbody>
@@ -110,7 +106,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
                 <div class="list-product-cell">
                   <div class="list-thumb" :class="{ placeholder: !row.image }">
                     <img v-if="row.image" :src="row.image" :alt="row.title" />
-                    <span v-else>No image</span>
+                    <span v-else>暂无图片</span>
                   </div>
                   <div class="list-product-copy">
                     <strong class="list-title">{{ row.title }}</strong>
@@ -141,17 +137,17 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
           </tbody>
         </table>
       </div>
-      <p v-else class="empty-state">No collection tasks yet.</p>
+      <p v-else class="empty-state">暂无采集任务。</p>
     </template>
 
     <template v-else-if="intakeTab === 'families' && !selectedFamily">
       <div class="toolbar toolbar-compact">
         <label class="toolbar-field grow">
-          <span>Search Families</span>
-          <input v-model="filters.familyQuery" type="text" placeholder="title / brand / family key" />
+          <span>搜索商品族</span>
+          <input v-model="filters.familyQuery" type="text" placeholder="标题 / 品牌 / 商品族键" />
         </label>
         <label class="toolbar-field">
-          <span>Marketplace</span>
+          <span>站点</span>
           <select v-model="filters.familyMarketplace">
             <option v-for="option in familyMarketplaceOptions" :key="option.value" :value="option.value">
               {{ option.label }}
@@ -164,12 +160,12 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
         <table>
           <thead>
             <tr>
-              <th class="col-product">Product</th>
-              <th>Source URL</th>
-              <th>Marketplace</th>
-              <th>Status</th>
-              <th>Variants</th>
-              <th>Action</th>
+              <th class="col-product">商品</th>
+              <th>来源链接</th>
+              <th>站点</th>
+              <th>状态</th>
+              <th>变体数</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
@@ -177,12 +173,12 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
               <td>
                 <div class="list-product-cell">
                   <div class="list-thumb" :class="{ placeholder: !getFamilyImage(family) }">
-                    <img v-if="getFamilyImage(family)" :src="getFamilyImage(family)" :alt="family.title || 'family'" />
-                    <span v-else>No image</span>
+                    <img v-if="getFamilyImage(family)" :src="getFamilyImage(family)" :alt="family.title || '商品族'" />
+                    <span v-else>暂无图片</span>
                   </div>
                   <div class="list-product-copy">
-                    <strong class="list-title">{{ family.title || "Unnamed family" }}</strong>
-                    <span class="list-subtitle">{{ family.brand || "Brand pending" }} · {{ familyLeadPrice(family) }}</span>
+                    <strong class="list-title">{{ family.title || "未命名商品族" }}</strong>
+                    <span class="list-subtitle">{{ family.brand || "品牌待定" }} · {{ familyLeadPrice(family) }}</span>
                   </div>
                 </div>
               </td>
@@ -209,7 +205,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
               <td>
                 <div class="list-actions">
                   <button type="button" class="secondary-button inline-button" @click="openFamilyDetail(family.id)">
-                    Open
+                    打开
                   </button>
                   <button
                     type="button"
@@ -217,7 +213,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
                     :disabled="Boolean(family.selection_id)"
                     @click="addToSelection(family.id)"
                   >
-                    {{ family.selection_id ? "Added" : "Add to Selection" }}
+                    {{ family.selection_id ? "已加入" : "加入选品" }}
                   </button>
                 </div>
               </td>
@@ -225,21 +221,21 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
           </tbody>
         </table>
       </div>
-      <p v-else class="empty-state">No matching product families.</p>
+      <p v-else class="empty-state">没有匹配的商品族。</p>
     </template>
 
     <div v-else-if="intakeTab === 'families'" class="detail-panel">
-      <button type="button" class="secondary-button back-button" @click="closeFamilyDetail">Back to List</button>
+      <button type="button" class="secondary-button back-button" @click="closeFamilyDetail">返回列表</button>
 
       <div class="detail-hero">
         <div class="list-thumb detail-thumb" :class="{ placeholder: !getFamilyImage(selectedFamily) }">
-          <img v-if="getFamilyImage(selectedFamily)" :src="getFamilyImage(selectedFamily)" :alt="selectedFamily.title || 'family'" />
-          <span v-else>No image</span>
+          <img v-if="getFamilyImage(selectedFamily)" :src="getFamilyImage(selectedFamily)" :alt="selectedFamily.title || '商品族'" />
+          <span v-else>暂无图片</span>
         </div>
         <div class="detail-hero-copy">
-          <h4>{{ selectedFamily.title || "Unnamed family" }}</h4>
+          <h4>{{ selectedFamily.title || "未命名商品族" }}</h4>
           <div class="meta-line compact">
-            <span>{{ selectedFamily.brand || "Brand pending" }}</span>
+            <span>{{ selectedFamily.brand || "品牌待定" }}</span>
             <span>{{ getMarketplaceLabel(selectedFamily.marketplace) }}</span>
             <span>{{ familyLeadPrice(selectedFamily) }}</span>
             <span v-if="selectedFamily.rating">{{ selectedFamily.rating }}</span>
@@ -261,7 +257,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
               target="_blank"
               rel="noreferrer"
             >
-              Open Source
+              打开来源
             </a>
             <button
               type="button"
@@ -269,14 +265,14 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
               :disabled="Boolean(selectedFamily.selection_id)"
               @click="addToSelection(selectedFamily.id)"
             >
-              {{ selectedFamily.selection_id ? "Added to Selection" : "Add to Selection" }}
+              {{ selectedFamily.selection_id ? "已加入选品" : "加入选品" }}
             </button>
           </div>
         </div>
       </div>
 
       <div v-if="selectedFamily.bullet_points?.length" class="detail-block">
-        <h5>Bullet Points</h5>
+        <h5>五点描述</h5>
         <ul class="bullet-preview">
           <li v-for="bullet in selectedFamily.bullet_points" :key="bullet">{{ bullet }}</li>
         </ul>
@@ -284,8 +280,8 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
 
       <div class="detail-block">
         <div class="subpanel-head">
-          <h5>Variants</h5>
-          <span>{{ selectedFamily.variant_count }} records</span>
+          <h5>变体</h5>
+          <span>{{ selectedFamily.variant_count }} 条记录</span>
         </div>
         <div class="variant-card-list">
           <article
@@ -297,7 +293,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
             <div class="variant-card-head">
               <div class="variant-card-media">
                 <img v-if="getVariantImage(variant)" :src="getVariantImage(variant)" :alt="getVariantTitle(variant, selectedFamily)" />
-                <span v-else class="variant-card-placeholder">No image</span>
+                <span v-else class="variant-card-placeholder">暂无图片</span>
               </div>
 
               <div class="variant-card-body">
@@ -317,7 +313,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
                     :class="{ active: isVariantExpanded(variant.id) }"
                     @click="toggleVariantDetail(variant.id)"
                   >
-                    {{ isVariantExpanded(variant.id) ? "Collapse" : "Detail" }}
+                    {{ isVariantExpanded(variant.id) ? "收起" : "详情" }}
                   </button>
                   <a
                     v-if="variant.source_url"
@@ -335,15 +331,15 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
             <div v-if="isVariantExpanded(variant.id)" class="variant-card-detail">
               <div class="variant-detail-meta">
                 <div v-if="variant.parent_asin" class="variant-meta-item">
-                  <span>Parent ASIN</span>
+                  <span>父 ASIN</span>
                   <strong>{{ variant.parent_asin }}</strong>
                 </div>
                 <div v-if="variant.snapshot_time" class="variant-meta-item">
-                  <span>Captured At</span>
+                  <span>采集时间</span>
                   <strong>{{ formatDate(variant.snapshot_time) }}</strong>
                 </div>
                 <div v-if="variant.source_url" class="variant-meta-item variant-meta-item-wide">
-                  <span>Source URL</span>
+                  <span>来源链接</span>
                   <a class="text-link" :href="variant.source_url" target="_blank" rel="noreferrer">
                     {{ truncateUrl(variant.source_url, 80) }}
                   </a>
@@ -351,7 +347,7 @@ const { submitCollection, addToSelection, openFamilyDetail, closeFamilyDetail, t
               </div>
 
               <div v-if="getVariantBulletPoints(variant, selectedFamily).length" class="variant-detail-section">
-                <strong>Bullet Points</strong>
+                <strong>五点描述</strong>
                 <ul class="variant-bullet-list">
                   <li v-for="bullet in getVariantBulletPoints(variant, selectedFamily)" :key="bullet">
                     {{ bullet }}

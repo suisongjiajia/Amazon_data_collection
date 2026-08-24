@@ -1,0 +1,15 @@
+{
+  "widgetStates": {
+    "webProductHeading-1-default-1": "{\"title\":\"Zekkert 稳定杆连杆, 2 个\",\"brand\":\"Zekkert\"}",
+    "webPrice-1-default-1": "{\"cardPrice\":\"1 614 ₽\",\"price\":\"1 614 ₽\"}",
+    "webGallery-1-default-1": "{\"sku\":\"1002277569\",\"coverImage\":\"https://example.com/cover.jpg\",\"images\":[{\"src\":\"https://example.com/1.jpg\"}]}",
+    "breadCrumbs-1-default-1": "{\"breadcrumbs\":[{\"text\":\"Авто\"},{\"text\":\"Запчасти\"},{\"text\":\"Стойки стабилизатора\"}]}",
+    "webShortCharacteristics-1-default-1": "{\"characteristics\":[{\"title\":{\"textRs\":[{\"text\":\"Тип\"}]},\"values\":[{\"text\":\"стабилизатор\"}]},{\"title\":{\"textRs\":[{\"text\":\"Модель\"}]},\"values\":[{\"text\":\"SS1367-X2\"}]}]}",
+    "webDescription-2-pdpPage2column-2": "{\"richAnnotation\":{\"content\":[{\"type\":\"text\",\"content\":\"Комплект стоек стабилизатора Zekkert.\"},{\"type\":\"bullet\",\"items\":[{\"type\":\"text\",\"content\":\"Ford Focus II\"}]}]}}",
+    "webCharacteristics-2-pdpPage2column-2": "{\"characteristics\":[{\"title\":{\"textRs\":[{\"text\":\"Длина, мм\"}]},\"values\":[{\"text\":\"298\"}]},{\"title\":{\"textRs\":[{\"text\":\"Ширина, мм\"}]},\"values\":[{\"text\":\"80\"}]},{\"title\":{\"textRs\":[{\"text\":\"Высота, мм\"}]},\"values\":[{\"text\":\"60\"}]},{\"title\":{\"textRs\":[{\"text\":\"Материал\"}]},\"values\":[{\"text\":\"сталь\"}]}]}"
+  },
+  "seo": {
+    "title": "Zekkert 稳定杆连杆",
+    "link": [{"href": "/product/zekkert-stabilizator-1002277569/"}]
+  }
+}

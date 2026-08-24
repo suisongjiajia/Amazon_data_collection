@@ -1,0 +1,5 @@
+{
+  "widgetStates": {
+    "tileGridDesktop-1-default-1": "{\"items\":[{\"sku\":\"1234567890\",\"action\":{\"link\":\"/product/demo-product-1234567890/\"},\"tileImage\":{\"coverImage\":\"https://cdn1.ozonusercontent.com/demo.jpg\",\"items\":[{\"image\":{\"link\":\"https://cdn1.ozonusercontent.com/demo.jpg\"}}]},\"mainState\":[{\"id\":\"name\",\"textDS\":{\"text\":\"Тестовый товар Ozon\"}},{\"type\":\"priceV2\",\"priceV2\":{\"price\":[{\"textStyle\":\"PRICE\",\"text\":\"1 299 ₽\"},{\"textStyle\":\"ORIGINAL_PRICE\",\"text\":\"1 599 ₽\"}]}},{\"labelListV2\":{\"items\":[{\"type\":\"text\",\"text\":{\"text\":\"4.8\"}},{\"type\":\"text\",\"text\":{\"text\":\"128\"}}]}}]}],\"infiniteVirtualPaginator\":{\"nextPage\":null}}"
+  }
+}

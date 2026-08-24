@@ -9,12 +9,22 @@ from schemas import (
     ListingDraftCreateRequest,
     ListingDraftUpdateRequest,
     ListingDraftVariantUpdateRequest,
+    OzonCollectionRequest,
+    OzonCollectUrlRequest,
+    OzonPublishRequest,
+    AiProductEditRequest,
     ProductCreateRequest,
+    ProductEditUpdateRequest,
+    ProductEditVariantUpdateRequest,
     PublishTaskCreateRequest,
+    ReviewDecisionRequest,
     SelectionCreateRequest,
     SelectionVariantScopeUpdateRequest,
+    SourcingSearchRequest,
 )
 from services import catalog_service, collection_service, draft_service, publish_service
+from services import ozon_collection_service, ozon_publish_service, product_edit_service, review_service, sourcing_service
+from services import ai_product_edit_service
 
 router = APIRouter(prefix="/api")
 
@@ -197,3 +207,202 @@ def list_publish_tasks(limit: int = 100) -> list[dict[str, Any]]:
 @router.get("/listing-live")
 def list_listing_live(limit: int = 100) -> list[dict[str, Any]]:
     return database.list_listing_live(limit)
+
+
+# --- Ozon workflow ---
+
+
+@router.post("/ozon/collect")
+def collect_ozon_url(request: OzonCollectUrlRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_collection_service.run_ozon_url_collection(request.url),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/ozon/collections")
+def create_ozon_collection(request: OzonCollectionRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_collection_service.run_ozon_collection_task(
+            request.strategy_type,
+            request.strategy_params,
+            source_url=request.source_url,
+        ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.get("/ozon/collections")
+def list_ozon_collections(limit: int = 50) -> list[dict[str, Any]]:
+    return ozon_collection_service.list_tasks(limit)
+
+
+@router.get("/ozon/products")
+def list_ozon_products(limit: int = 100) -> list[dict[str, Any]]:
+    return ozon_collection_service.list_families(limit)
+
+
+@router.post("/sourcing/search")
+def search_sourcing(request: SourcingSearchRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: sourcing_service.search_suppliers_by_image(request.raw_product_family_id),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.get("/sourcing/tasks")
+def list_sourcing_tasks(limit: int = 50) -> list[dict[str, Any]]:
+    return sourcing_service.list_tasks(limit)
+
+
+@router.get("/sourcing/candidates")
+def list_sourcing_candidates(
+    raw_product_family_id: int | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    return sourcing_service.list_candidates(raw_product_family_id, limit)
+
+
+@router.get("/sourcing/detail/{raw_product_family_id}")
+def get_sourcing_detail(raw_product_family_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: sourcing_service.get_sourcing_detail(raw_product_family_id),
+        value_error_status=404,
+    )
+
+
+@router.post("/sourcing/candidates/{candidate_id}/select")
+def select_sourcing_candidate(candidate_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: sourcing_service.select_candidate(candidate_id),
+        value_error_status=404,
+    )
+
+
+@router.post("/sourcing/candidates/{candidate_id}/unselect")
+def unselect_sourcing_candidate(candidate_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: sourcing_service.unselect_candidate(candidate_id),
+        value_error_status=404,
+    )
+
+
+@router.post("/product-edits/ai-generate")
+def ai_generate_product_edit(request: AiProductEditRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ai_product_edit_service.generate_product_edit(request.raw_product_family_id),
+        value_error_status=404,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/product-edits")
+def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.create_edit(raw_product_family_id),
+        value_error_status=404,
+    )
+
+
+@router.get("/product-edits")
+def list_product_edits(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    return product_edit_service.list_edits(status, limit)
+
+
+@router.get("/product-edits/{edit_id}")
+def get_product_edit(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.get_edit(edit_id),
+        value_error_status=404,
+    )
+
+
+@router.patch("/product-edits/{edit_id}")
+def update_product_edit(edit_id: int, request: ProductEditUpdateRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.update_edit(
+            edit_id,
+            title=request.title,
+            description=request.description,
+            bullet_points=request.bullet_points,
+            images=request.images,
+            attributes=request.attributes,
+        ),
+        value_error_status=404,
+    )
+
+
+@router.delete("/product-edits/{edit_id}")
+def delete_product_edit(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.delete_edit(edit_id),
+        value_error_status=400,
+    )
+
+
+@router.post("/product-edits/{edit_id}/submit-review")
+def submit_product_edit_review(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.submit_for_review(edit_id),
+        value_error_status=400,
+    )
+
+
+@router.patch("/product-edit-variants/{variant_id}")
+def update_product_edit_variant(
+    variant_id: int,
+    request: ProductEditVariantUpdateRequest,
+) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.update_variant(
+            variant_id,
+            title=request.title,
+            price=request.price,
+            quantity=request.quantity,
+            image_url=request.image_url,
+            variant_attributes=request.variant_attributes,
+        ),
+        value_error_status=404,
+    )
+
+
+@router.get("/reviews")
+def list_reviews(edit_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+    return review_service.list_records(edit_id, limit)
+
+
+@router.post("/reviews/{edit_id}/approve")
+def approve_review(edit_id: int, request: ReviewDecisionRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: review_service.approve(edit_id, note=request.note, reviewer=request.reviewer),
+        value_error_status=400,
+    )
+
+
+@router.post("/reviews/{edit_id}/reject")
+def reject_review(edit_id: int, request: ReviewDecisionRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: review_service.reject(edit_id, note=request.note, reviewer=request.reviewer),
+        value_error_status=400,
+    )
+
+
+@router.post("/ozon/publish-tasks")
+def create_ozon_publish_task(request: OzonPublishRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_publish_service.publish_edit(
+            request.edit_id,
+            shop_name=request.shop_name,
+            simulate=request.simulate,
+        ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.get("/ozon/publish-tasks")
+def list_ozon_publish_tasks(limit: int = 50) -> list[dict[str, Any]]:
+    return ozon_publish_service.list_tasks(limit)

@@ -60,3 +60,48 @@ class PublishTaskCreateRequest(BaseModel):
     shop_name: str | None = None
     marketplace: str | None = None
     simulate: bool = True
+
+
+class OzonCollectionRequest(BaseModel):
+    strategy_type: str
+    strategy_params: dict[str, Any] = Field(default_factory=dict)
+    source_url: str = ""
+
+
+class OzonCollectUrlRequest(BaseModel):
+    url: str
+
+
+class SourcingSearchRequest(BaseModel):
+    raw_product_family_id: int
+
+
+class ProductEditUpdateRequest(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    bullet_points: list[str] | None = None
+    images: list[str] | None = None
+    attributes: dict[str, Any] | None = None
+
+
+class ProductEditVariantUpdateRequest(BaseModel):
+    title: str | None = None
+    price: float | None = None
+    quantity: int | None = None
+    image_url: str | None = None
+    variant_attributes: dict[str, Any] | None = None
+
+
+class ReviewDecisionRequest(BaseModel):
+    note: str | None = None
+    reviewer: str | None = "owner"
+
+
+class OzonPublishRequest(BaseModel):
+    edit_id: int
+    shop_name: str | None = None
+    simulate: bool = True
+
+
+class AiProductEditRequest(BaseModel):
+    raw_product_family_id: int
