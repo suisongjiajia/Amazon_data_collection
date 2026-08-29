@@ -62,7 +62,11 @@ class OzonSellerClient:
         return data if isinstance(data, dict) else {"result": data}
 
     def import_products(self, items: list[dict[str, Any]]) -> dict[str, Any]:
-        return self.request("POST", "/v2/product/import", {"items": items})
+        # v3 要求 description_category_id + type_id
+        return self.request("POST", "/v3/product/import", {"items": items})
 
     def get_import_info(self, task_id: int) -> dict[str, Any]:
         return self.request("POST", "/v1/product/import/info", {"task_id": task_id})
+
+    def update_stocks(self, stocks: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.request("POST", "/v2/products/stocks", {"stocks": stocks})

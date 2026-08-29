@@ -54,6 +54,8 @@ def test_parse_product_details_from_fixture():
     assert details["attributes"]["Длина, мм"] == "298"
     assert details["size"] == "298×80×60 mm"
     assert details["category_name"] == "Авто / Запчасти"
+    assert details["description_category_id"] == "17028922"
+    assert details["type_id"] == "971438216"
 
 
 def test_apply_cookie_string():

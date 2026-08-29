@@ -18,8 +18,8 @@ SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的 
 4. attributes 保留并补充关键规格（类型、型号、尺寸、重量、材质、品牌等），键名用俄语或通用英文。
 5. search_keywords 为俄语搜索词数组。
 6. category_hint 为建议的 Ozon 类目路径（俄语或中文均可）。
-7. variants 数组：每个变体含 title（俄语）、price（卢布整数，参考原价与货源成本合理定价）、quantity（建议库存，默认 10）。
-8. listing_notes 用中文简要说明定价思路与注意事项。
+7. variants 数组：每个变体含 title（俄语）。不要自行编造 price / quantity，价格与库存由系统公式计算。
+8. listing_notes 用中文简要说明文案注意点（不要写定价公式）。
 
 只输出 JSON 对象，不要 markdown，字段：
 {
@@ -29,7 +29,7 @@ SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的 
   "attributes": {"string": "string"},
   "search_keywords": ["string"],
   "category_hint": "string",
-  "variants": [{"title": "string", "price": number, "quantity": number}],
+  "variants": [{"title": "string"}],
   "listing_notes": "string"
 }"""
 
@@ -82,6 +82,8 @@ def _build_ai_context(raw_product_family_id: int) -> dict[str, Any]:
             "attributes": product.get("attributes") or {},
             "images": product.get("images") or [],
             "main_image_url": product.get("main_image_url"),
+            "description_category_id": product.get("description_category_id"),
+            "type_id": product.get("type_id"),
             "rating": product.get("rating"),
             "review_count": product.get("review_count"),
             "source_url": product.get("source_url"),
@@ -91,9 +93,12 @@ def _build_ai_context(raw_product_family_id: int) -> dict[str, Any]:
 
 
 def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:
+    from services.ozon_pricing_service import DEFAULT_STOCK_QTY
+
     ozon = context.get("ozon_product") or {}
     external_id = ozon.get("external_id") or "sku"
     default_sku = f"OZON-{external_id}"
+    default_qty = DEFAULT_STOCK_QTY
 
     variants_raw = raw.get("variants")
     variants: list[dict[str, Any]] = []
@@ -101,18 +106,12 @@ def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[s
         for index, item in enumerate(variants_raw):
             if not isinstance(item, dict):
                 continue
-            price = _parse_price_number(item.get("price")) or _parse_price_number(ozon.get("price_text"))
-            quantity = item.get("quantity")
-            try:
-                quantity = int(quantity)
-            except (TypeError, ValueError):
-                quantity = 10
             variants.append(
                 {
                     "sku": str(item.get("sku") or default_sku if index == 0 else f"{default_sku}-{index + 1}"),
                     "title": str(item.get("title") or raw.get("title") or ozon.get("title") or ""),
-                    "price": price,
-                    "quantity": max(0, quantity),
+                    "price": None,
+                    "quantity": default_qty,
                 }
             )
     else:
@@ -120,8 +119,8 @@ def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[s
             {
                 "sku": default_sku,
                 "title": str(raw.get("title") or ozon.get("title") or ""),
-                "price": _parse_price_number(ozon.get("price_text")),
-                "quantity": 10,
+                "price": None,
+                "quantity": default_qty,
             }
         )
 
@@ -134,6 +133,14 @@ def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[s
     if not isinstance(attributes, dict):
         attributes = {}
     attributes = {str(k): str(v) for k, v in attributes.items() if v is not None and str(v).strip()}
+
+    # 保留采集到的上架 ID，不被 AI 覆盖
+    for key in ("description_category_id", "type_id", "size", "weight"):
+        value = ozon.get(key)
+        if value and key not in attributes:
+            attributes[key] = str(value)
+    attributes.setdefault("brand_mode", "no_brand")
+    attributes.setdefault("fulfillment", "rFBS")
 
     search_keywords = raw.get("search_keywords")
     if isinstance(search_keywords, list) and search_keywords:
@@ -158,11 +165,65 @@ def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[s
     }
 
 
-def generate_product_edit(raw_product_family_id: int) -> dict[str, Any]:
+def _apply_pricing_and_images(
+    raw_product_family_id: int,
+    suggestion: dict[str, Any],
+    *,
+    rehost_images: bool = True,
+) -> dict[str, Any]:
+    from services.ozon_pricing_service import suggest_price_for_family
+    from integrations.aliyun_oss import rehost_image_urls
+    from integrations.aliyun_oss.client import OssError
+
+    pricing_result: dict[str, Any] | None = None
+    try:
+        pricing_result = suggest_price_for_family(raw_product_family_id)
+        price_rub = pricing_result["pricing"]["price_rub"]
+        stock_qty = pricing_result["pricing"]["stock_qty"]
+        for variant in suggestion.get("variants") or []:
+            variant["price"] = price_rub
+            variant["quantity"] = stock_qty
+        note = pricing_result.get("listing_notes") or ""
+        old = suggestion.get("listing_notes") or ""
+        suggestion["listing_notes"] = f"{note}\n{old}".strip()
+        suggestion.setdefault("attributes", {})
+        suggestion["attributes"]["pricing_formula"] = pricing_result["pricing"]["formula"]
+        suggestion["attributes"]["freight_channel"] = pricing_result["freight"]["channel_name"]
+        suggestion["attributes"]["freight_cny"] = str(pricing_result["freight"]["freight_cny"])
+    except Exception as exc:
+        suggestion.setdefault("attributes", {})
+        suggestion["attributes"]["pricing_error"] = str(exc)
+        for variant in suggestion.get("variants") or []:
+            if variant.get("quantity") in {None, 0, 10}:
+                from services.ozon_pricing_service import DEFAULT_STOCK_QTY
+
+                variant["quantity"] = DEFAULT_STOCK_QTY
+
+    image_result: dict[str, Any] | None = None
+    if rehost_images and suggestion.get("images"):
+        try:
+            sku = (suggestion.get("variants") or [{}])[0].get("sku") or f"family-{raw_product_family_id}"
+            image_result = rehost_image_urls(list(suggestion["images"]), sku=str(sku))
+            suggestion["images"] = image_result["images"]
+        except OssError as exc:
+            suggestion.setdefault("attributes", {})
+            suggestion["attributes"]["image_rehost_error"] = str(exc)
+        except Exception as exc:
+            suggestion.setdefault("attributes", {})
+            suggestion["attributes"]["image_rehost_error"] = str(exc)
+
+    return {
+        "suggestion": suggestion,
+        "pricing": pricing_result,
+        "image_rehost": image_result,
+    }
+
+
+def generate_product_edit(raw_product_family_id: int, *, rehost_images: bool = True) -> dict[str, Any]:
     context = _build_ai_context(raw_product_family_id)
     user_prompt = (
-        "请根据以下 JSON 数据生成 Ozon 上架内容。"
-        "若 1688 货源为空，仅依据 Ozon 采集信息生成。\n\n"
+        "请根据以下 JSON 数据生成 Ozon 上架文案（标题/描述/卖点/规格）。"
+        "不要编造售价与库存。若 1688 货源为空，仅依据 Ozon 采集信息生成。\n\n"
         f"{json.dumps(context, ensure_ascii=False, indent=2)}"
     )
 
@@ -177,4 +238,15 @@ def generate_product_edit(raw_product_family_id: int) -> dict[str, Any]:
     result = _normalize_ai_result(raw, context)
     if not result["title"]:
         raise DeepSeekError("AI 未生成有效标题")
-    return {"context": context, "suggestion": result}
+
+    applied = _apply_pricing_and_images(
+        raw_product_family_id,
+        result,
+        rehost_images=rehost_images,
+    )
+    return {
+        "context": context,
+        "suggestion": applied["suggestion"],
+        "pricing": applied["pricing"],
+        "image_rehost": applied["image_rehost"],
+    }

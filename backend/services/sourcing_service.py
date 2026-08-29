@@ -90,6 +90,8 @@ def _enrich_ozon_family_for_display(family: dict[str, Any]) -> dict[str, Any]:
         "rating": family.get("rating"),
         "review_count": family.get("review_count"),
         "category_name": category_name,
+        "description_category_id": family.get("category_id") or details.get("description_category_id"),
+        "type_id": family.get("type_id") or details.get("type_id"),
         "sales_rank": family.get("sales_rank"),
         "hot_score": family.get("hot_score"),
         "price_text": _format_rub_price(variant.get("price_text") or details.get("price") or raw.get("price")),

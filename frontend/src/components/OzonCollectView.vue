@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { computed, ref } from "vue";
 
 import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
+import type { OzonProductFamily } from "../types/ozon-workflow";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -15,6 +16,26 @@ import ErpStatGrid from "./erp/ErpStatGrid.vue";
 const store = useAppStore();
 const module = getModuleDefinition("ozon-collect");
 const collectionUrl = ref("");
+
+function productCollectUrl(item: Pick<OzonProductFamily, "source_url" | "external_id">): string | null {
+  const direct = item.source_url?.trim();
+  if (direct) return direct;
+  const externalId = item.external_id?.trim();
+  if (externalId) return `https://www.ozon.ru/product/${externalId}/`;
+  return null;
+}
+
+function truncateUrl(value: string, maxLength = 48): string {
+  if (value.length <= maxLength) return value;
+  return `${value.slice(0, maxLength - 1)}…`;
+}
+
+const productRows = computed(() =>
+  store.state.value.ozonProducts.map((item) => ({
+    item,
+    collectUrl: productCollectUrl(item),
+  })),
+);
 
 async function submitCollection(): Promise<void> {
   const url = collectionUrl.value.trim();
@@ -66,24 +87,38 @@ async function submitCollection(): Promise<void> {
     </ErpCard>
 
     <ErpCard title="商品列表" :description="`${store.state.value.ozonProducts.length} 条`" padding="none">
-      <div v-if="store.state.value.ozonProducts.length" class="erp-table-wrap">
+      <div v-if="productRows.length" class="erp-table-wrap">
         <table class="erp-table">
           <thead>
             <tr>
               <th>商品</th>
+              <th>采集链接</th>
               <th>价格</th>
               <th>排名</th>
               <th>品牌</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="item in store.state.value.ozonProducts" :key="item.id">
+            <tr v-for="{ item, collectUrl } in productRows" :key="item.id">
               <td>
                 <ErpProductCell
                   :image-url="item.main_image_url"
                   :title="item.title"
                   :subtitle="item.external_id"
                 />
+              </td>
+              <td>
+                <a
+                  v-if="collectUrl"
+                  class="text-link url-cell"
+                  :href="collectUrl"
+                  target="_blank"
+                  rel="noreferrer"
+                  :title="collectUrl"
+                >
+                  {{ truncateUrl(collectUrl) }}
+                </a>
+                <span v-else>-</span>
               </td>
               <td>{{ item.variants?.[0]?.price_text ?? "-" }}</td>
               <td>{{ item.sales_rank ?? "-" }}</td>

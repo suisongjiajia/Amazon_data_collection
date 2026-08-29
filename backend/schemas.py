@@ -105,3 +105,14 @@ class OzonPublishRequest(BaseModel):
 
 class AiProductEditRequest(BaseModel):
     raw_product_family_id: int
+    rehost_images: bool = True
+
+
+class SuggestPriceRequest(BaseModel):
+    raw_product_family_id: int
+
+
+class RehostImagesRequest(BaseModel):
+    raw_product_family_id: int | None = None
+    images: list[str] | None = None
+    sku: str | None = None

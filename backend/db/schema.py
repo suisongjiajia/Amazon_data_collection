@@ -99,7 +99,8 @@ CREATE_TABLE_STATEMENTS = [
         review_count        VARCHAR(64)     NULL COMMENT '评论数',
         main_image_url      VARCHAR(1024)   NULL COMMENT '主图 URL',
         sales_rank          INT             NULL COMMENT '销量排名',
-        category_id         VARCHAR(64)     NULL COMMENT '类目 ID',
+        category_id         VARCHAR(64)     NULL COMMENT '类目 ID / description_category_id',
+        type_id             VARCHAR(64)     NULL COMMENT 'Ozon type_id',
         category_name       VARCHAR(255)    NULL COMMENT '类目名称',
         hot_score           DECIMAL(10, 2)  NULL COMMENT '热销分',
         variant_dimensions  JSON            NULL COMMENT '变体维度',
@@ -200,6 +201,8 @@ CREATE_TABLE_STATEMENTS = [
         bullet_points       JSON            NULL COMMENT '卖点',
         images              JSON            NULL COMMENT '图片列表',
         attributes          JSON            NULL COMMENT '扩展属性',
+        listing_payload     JSON            NULL COMMENT '已生成的上架 Listing 快照',
+        listing_built_at    DATETIME        NULL COMMENT 'Listing 生成时间',
         status              VARCHAR(32)     NOT NULL DEFAULT 'editing' COMMENT '状态',
         target_platform     VARCHAR(32)     NOT NULL DEFAULT 'ozon' COMMENT '目标平台',
         created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -303,7 +306,9 @@ JSON_FIELDS = {
     "attributes",
     "payload",
     "submission_payload",
+    "listing_payload",
     "images",
+    "edit_images",
     "response_payload",
     "strategy_params",
 }
@@ -314,6 +319,9 @@ def init_db() -> None:
         with connection.cursor() as cursor:
             for statement in CREATE_TABLE_STATEMENTS:
                 cursor.execute(statement)
+    from db.migrations import run_migrations
+
+    run_migrations()
     drop_legacy_tables()
     apply_table_comments()
 

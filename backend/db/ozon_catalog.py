@@ -123,12 +123,13 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
                         main_image_url,
                         sales_rank,
                         category_id,
+                        type_id,
                         category_name,
                         hot_score,
                         variant_dimensions,
                         bullet_points,
                         raw_payload
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         task_id = VALUES(task_id),
                         title = COALESCE(VALUES(title), title),
@@ -138,6 +139,7 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
                         main_image_url = COALESCE(VALUES(main_image_url), main_image_url),
                         sales_rank = COALESCE(VALUES(sales_rank), sales_rank),
                         category_id = COALESCE(VALUES(category_id), category_id),
+                        type_id = COALESCE(VALUES(type_id), type_id),
                         category_name = COALESCE(VALUES(category_name), category_name),
                         hot_score = COALESCE(VALUES(hot_score), hot_score),
                         raw_payload = VALUES(raw_payload),
@@ -157,6 +159,7 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
                         product.get("main_image_url"),
                         product.get("sales_rank"),
                         product.get("category_id"),
+                        product.get("type_id"),
                         product.get("category_name"),
                         product.get("hot_score"),
                         to_json(product.get("variant_dimensions") or []),

@@ -242,6 +242,8 @@ async function unselectCandidate(candidateId: number): Promise<void> {
             <div class="erp-detail-item"><span>尺寸</span><strong>{{ detail.product.size || "-" }}</strong></div>
             <div class="erp-detail-item"><span>重量</span><strong>{{ detail.product.weight || "-" }}</strong></div>
             <div class="erp-detail-item"><span>类目</span><strong>{{ detail.product.category_name || "-" }}</strong></div>
+            <div class="erp-detail-item"><span>类目 ID</span><strong>{{ detail.product.description_category_id || "-" }}</strong></div>
+            <div class="erp-detail-item"><span>type_id</span><strong>{{ detail.product.type_id || "-" }}</strong></div>
             <div class="erp-detail-item"><span>热销排名</span><strong>{{ detail.product.sales_rank ?? "-" }}</strong></div>
           </div>
           <p class="erp-detail-text" style="margin-top: 14px">

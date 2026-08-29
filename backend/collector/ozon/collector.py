@@ -141,6 +141,31 @@ class OzonCollector:
         if not product_id:
             raise RuntimeError("无法解析 Ozon 商品详情")
 
+        category_id = details.get("description_category_id") or details.get("category_id")
+        type_id = details.get("type_id")
+        seller_tree: dict[str, Any] | None = None
+        try:
+            from integrations.ozon_seller.seller_tree import try_resolve_by_sku
+
+            resolved = try_resolve_by_sku(str(product_id))
+            if resolved is not None:
+                # 卖家后台解析结果优先（比面包屑 categoryId 更准确）
+                category_id = resolved.description_category_id
+                type_id = resolved.type_id
+                details["description_category_id"] = category_id
+                details["type_id"] = type_id
+                seller_tree = {
+                    "description_category_id": category_id,
+                    "type_id": type_id,
+                    "raw": resolved.raw,
+                }
+        except Exception:
+            seller_tree = None
+
+        raw_payload: dict[str, Any] = {"details": details, "page_path": parsed.page_path}
+        if seller_tree is not None:
+            raw_payload["seller_tree"] = seller_tree
+
         return OzonProductInfo(
             product_id=str(product_id),
             title=details.get("name"),
@@ -149,11 +174,13 @@ class OzonCollector:
             main_image_url=details.get("image"),
             source_url=details.get("url") or parsed.source_url,
             sales_rank=1,
+            category_id=category_id,
+            type_id=type_id,
             category_name=details.get("category_name"),
             rating=str(details.get("rating") or "") if details.get("rating") is not None else None,
             review_count=str(details.get("reviews") or "") if details.get("reviews") is not None else None,
             variant_attributes=dict(details.get("attributes") or {}),
-            raw_payload={"details": details, "page_path": parsed.page_path},
+            raw_payload=raw_payload,
         )
 
     def _collect_from_listing(self, parsed: OzonParseResult, max_products: int | None = None) -> list[OzonProductInfo]:

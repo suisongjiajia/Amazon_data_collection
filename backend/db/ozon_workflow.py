@@ -155,9 +155,48 @@ def update_supplier_candidate_status(candidate_id: int, status: str) -> dict[str
 
 def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
     from db.ozon_catalog import get_ozon_product_family
+    from services.ozon_pricing_service import DEFAULT_STOCK_QTY, suggest_price_for_family
 
     family = get_ozon_product_family(raw_product_family_id)
-    images = [family.get("main_image_url")] if family.get("main_image_url") else []
+    raw = family.get("raw_payload") or {}
+    inner = raw.get("rawPayload") or {}
+    details = inner.get("details") or raw.get("details") or {}
+    images = list(details.get("images") or [])
+    if not images and family.get("main_image_url"):
+        images = [family.get("main_image_url")]
+
+    attributes: dict[str, Any] = dict(details.get("attributes") or {})
+    description_category_id = (
+        family.get("category_id")
+        or details.get("description_category_id")
+        or details.get("category_id")
+    )
+    type_id = family.get("type_id") or details.get("type_id")
+    if description_category_id:
+        attributes["description_category_id"] = str(description_category_id)
+    if type_id:
+        attributes["type_id"] = str(type_id)
+    if details.get("size"):
+        attributes.setdefault("size", details["size"])
+    if details.get("weight"):
+        attributes.setdefault("weight", details["weight"])
+    attributes.setdefault("brand_mode", "no_brand")
+    attributes.setdefault("fulfillment", "rFBS")
+
+    initial_qty = DEFAULT_STOCK_QTY
+    initial_price = None
+    try:
+        priced = suggest_price_for_family(raw_product_family_id)
+        initial_price = priced["pricing"]["price_rub"]
+        initial_qty = priced["pricing"]["stock_qty"]
+        attributes["pricing_formula"] = priced["pricing"]["formula"]
+        attributes["freight_channel"] = priced["freight"]["channel_name"]
+        attributes["freight_cny"] = str(priced["freight"]["freight_cny"])
+    except Exception as exc:
+        attributes["pricing_error"] = str(exc)
+
+    description = (details.get("description") or "").strip()
+
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -168,19 +207,24 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                     description,
                     bullet_points,
                     images,
+                    attributes,
                     status,
                     target_platform
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     title = VALUES(title),
+                    description = COALESCE(NULLIF(VALUES(description), ''), description),
+                    images = VALUES(images),
+                    attributes = VALUES(attributes),
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (
                     raw_product_family_id,
                     family.get("title") or "未命名商品",
-                    "",
+                    description,
                     to_json(family.get("bullet_points") or []),
                     to_json(images),
+                    to_json(attributes),
                     "draft",
                     "ozon",
                 ),
@@ -207,6 +251,8 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         title = COALESCE(VALUES(title), title),
+                        price = COALESCE(VALUES(price), price),
+                        quantity = VALUES(quantity),
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (
@@ -214,8 +260,8 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                         variant["id"],
                         sku,
                         variant.get("title"),
-                        None,
-                        0,
+                        initial_price,
+                        initial_qty,
                         variant.get("main_image_url"),
                         to_json(variant.get("variant_attributes") or {}),
                     ),
@@ -225,7 +271,16 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
 
 
 def get_product_edit(edit_id: int) -> dict[str, Any]:
-    record = fetch_one("SELECT * FROM product_edit WHERE id = %s", (edit_id,))
+    record = fetch_one(
+        """
+        SELECT pe.*, rf.title AS family_title, rf.main_image_url AS family_main_image_url,
+               rf.sales_rank, rf.category_name, rf.external_id AS family_external_id
+        FROM product_edit pe
+        JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
+        WHERE pe.id = %s
+        """,
+        (edit_id,),
+    )
     if record is None:
         raise ValueError(f"Product edit {edit_id} was not found")
     return _attach_edit_variants(record)
@@ -236,7 +291,7 @@ def list_product_edits(status: str | None = None, limit: int = 100) -> list[dict
         edits = fetch_all(
             """
             SELECT pe.*, rf.title AS family_title, rf.main_image_url AS family_main_image_url,
-                   rf.sales_rank, rf.category_name
+                   rf.sales_rank, rf.category_name, rf.external_id AS family_external_id
             FROM product_edit pe
             JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
             WHERE pe.status = %s
@@ -249,7 +304,7 @@ def list_product_edits(status: str | None = None, limit: int = 100) -> list[dict
         edits = fetch_all(
             """
             SELECT pe.*, rf.title AS family_title, rf.main_image_url AS family_main_image_url,
-                   rf.sales_rank, rf.category_name
+                   rf.sales_rank, rf.category_name, rf.external_id AS family_external_id
             FROM product_edit pe
             JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
             ORDER BY pe.updated_at DESC
@@ -269,29 +324,51 @@ def update_product_edit(
     images: list[str] | None = None,
     attributes: dict[str, Any] | None = None,
     status: str | None = None,
+    listing_payload: dict[str, Any] | None = None,
+    clear_listing: bool = False,
+    set_listing_built: bool = False,
 ) -> dict[str, Any]:
+    current = get_product_edit(edit_id)
     fields: list[str] = []
     values: list[Any] = []
+    content_changed = False
+
     if title is not None:
         fields.append("title = %s")
         values.append(title)
+        content_changed = True
     if description is not None:
         fields.append("description = %s")
         values.append(description)
+        content_changed = True
     if bullet_points is not None:
         fields.append("bullet_points = %s")
         values.append(to_json(bullet_points))
+        content_changed = True
     if images is not None:
         fields.append("images = %s")
         values.append(to_json(images))
+        content_changed = True
     if attributes is not None:
         fields.append("attributes = %s")
         values.append(to_json(attributes))
+        content_changed = True
+    if listing_payload is not None:
+        fields.append("listing_payload = %s")
+        values.append(to_json(listing_payload))
+    if set_listing_built:
+        fields.append("listing_built_at = %s")
+        values.append(datetime.now())
+    elif clear_listing or (content_changed and listing_payload is None):
+        fields.append("listing_payload = NULL")
+        fields.append("listing_built_at = NULL")
+        if status is None and current.get("status") == "listing_ready":
+            status = "editing"
     if status is not None:
         fields.append("status = %s")
         values.append(status)
     if not fields:
-        return get_product_edit(edit_id)
+        return current
 
     values.append(edit_id)
     with get_connection() as connection:
@@ -342,6 +419,16 @@ def update_product_edit_variant(
                 f"UPDATE product_edit_variant SET {', '.join(fields)} WHERE id = %s",
                 tuple(values),
             )
+            cursor.execute(
+                "SELECT edit_id FROM product_edit_variant WHERE id = %s",
+                (variant_id,),
+            )
+            row = cursor.fetchone()
+            edit_id = int(row[0]) if row else None
+    if edit_id is not None:
+        edit = get_product_edit(edit_id)
+        if edit.get("status") == "listing_ready" or edit.get("listing_payload"):
+            update_product_edit(edit_id, clear_listing=True, status="editing" if edit.get("status") == "listing_ready" else None)
     record = fetch_one("SELECT * FROM product_edit_variant WHERE id = %s", (variant_id,))
     if record is None:
         raise ValueError(f"Product edit variant {variant_id} was not found")
@@ -350,15 +437,24 @@ def update_product_edit_variant(
 
 def submit_product_edit_for_review(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
-    if edit["status"] not in ("draft", "editing", "rejected"):
-        raise ValueError("仅草稿或已驳回的编辑可提交审核")
-    return update_product_edit(edit_id, status="pending_review")
+    if edit["status"] not in ("listing_ready",):
+        raise ValueError("请先生成并校验 Listing，通过后再提交审核")
+    if not edit.get("listing_payload"):
+        raise ValueError("缺少 Listing 快照，请先点击「生成 Listing」")
+    return update_product_edit(edit_id, status="pending_review", clear_listing=False)
+
+
+def reopen_product_edit(edit_id: int) -> dict[str, Any]:
+    edit = get_product_edit(edit_id)
+    if edit["status"] not in ("listing_ready", "pending_review", "approved", "rejected"):
+        raise ValueError("当前状态不可重新打开编辑")
+    return update_product_edit(edit_id, status="editing", clear_listing=True)
 
 
 def delete_product_edit(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
-    if edit["status"] not in ("draft", "editing", "rejected"):
-        raise ValueError("待审核或已通过的编辑不能取消")
+    if edit["status"] not in ("draft", "editing", "rejected", "listing_ready"):
+        raise ValueError("待审核、已通过或已发布的编辑不能取消")
     with get_connection() as connection:
         with connection.cursor() as cursor:
             cursor.execute("DELETE FROM product_edit WHERE id = %s", (edit_id,))
@@ -373,6 +469,9 @@ def create_review_record(
     reviewer: str | None = None,
     auto_reviewed: bool = False,
 ) -> dict[str, Any]:
+    edit = get_product_edit(edit_id)
+    if edit["status"] != "pending_review":
+        raise ValueError("仅待审核 Listing 可审批")
     new_status = "approved" if result == "approved" else "rejected"
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -383,11 +482,11 @@ def create_review_record(
                 """,
                 (edit_id, result, note, reviewer, 1 if auto_reviewed else 0),
             )
+            review_id = int(cursor.lastrowid)
             cursor.execute(
                 "UPDATE product_edit SET status = %s WHERE id = %s",
                 (new_status, edit_id),
             )
-            review_id = cursor.lastrowid
     return get_review_record(review_id)
 
 
@@ -413,7 +512,7 @@ def list_review_records(edit_id: int | None = None, limit: int = 50) -> list[dic
 def create_ozon_publish_task(edit_id: int, *, shop_name: str | None = None) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
     if edit["status"] != "approved":
-        raise ValueError("仅审核通过的商品可发布")
+        raise ValueError("仅审核通过的 Listing 可发布")
 
     task_no = build_code("OZPUB")
     with get_connection() as connection:
@@ -426,7 +525,7 @@ def create_ozon_publish_task(edit_id: int, *, shop_name: str | None = None) -> d
                 """,
                 (task_no, edit_id, shop_name, "running", "api", datetime.now()),
             )
-            task_id = cursor.lastrowid
+            task_id = int(cursor.lastrowid)
             variants = edit.get("variants") or []
             for variant in variants:
                 cursor.execute(
@@ -447,7 +546,18 @@ def create_ozon_publish_task(edit_id: int, *, shop_name: str | None = None) -> d
 
 
 def get_ozon_publish_task(task_id: int) -> dict[str, Any]:
-    task = fetch_one("SELECT * FROM ozon_publish_task WHERE id = %s", (task_id,))
+    task = fetch_one(
+        """
+        SELECT opt.*, pe.title AS edit_title, pe.status AS edit_status, pe.images AS edit_images,
+               rf.main_image_url AS main_image_url, rf.title AS family_title,
+               rf.external_id AS family_external_id
+        FROM ozon_publish_task opt
+        JOIN product_edit pe ON pe.id = opt.edit_id
+        JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
+        WHERE opt.id = %s
+        """,
+        (task_id,),
+    )
     if task is None:
         raise ValueError(f"Ozon publish task {task_id} was not found")
     task["items"] = fetch_all(
@@ -459,7 +569,16 @@ def get_ozon_publish_task(task_id: int) -> dict[str, Any]:
 
 def list_ozon_publish_tasks(limit: int = 50) -> list[dict[str, Any]]:
     tasks = fetch_all(
-        "SELECT * FROM ozon_publish_task ORDER BY created_at DESC LIMIT %s",
+        """
+        SELECT opt.*, pe.title AS edit_title, pe.status AS edit_status, pe.images AS edit_images,
+               rf.main_image_url AS main_image_url, rf.title AS family_title,
+               rf.external_id AS family_external_id
+        FROM ozon_publish_task opt
+        JOIN product_edit pe ON pe.id = opt.edit_id
+        JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
+        ORDER BY opt.created_at DESC
+        LIMIT %s
+        """,
         (limit,),
     )
     for task in tasks:

@@ -269,6 +269,104 @@ def parse_category_name(page: dict[str, Any]) -> str | None:
     return None
 
 
+def _as_positive_int_id(value: Any) -> str | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return str(value) if value > 0 else None
+    if isinstance(value, float) and value.is_integer() and value > 0:
+        return str(int(value))
+    text = str(value).strip()
+    if text.isdigit() and int(text) > 0:
+        return text
+    return None
+
+
+def _pick_id(payload: dict[str, Any], keys: tuple[str, ...]) -> str | None:
+    for key in keys:
+        found = _as_positive_int_id(payload.get(key))
+        if found:
+            return found
+    return None
+
+
+def _iter_tracking_dicts(page: dict[str, Any]) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    tracking = page.get("layoutTrackingInfo")
+    if isinstance(tracking, str):
+        try:
+            tracking = json.loads(tracking)
+        except json.JSONDecodeError:
+            tracking = None
+    if isinstance(tracking, dict):
+        found.append(tracking)
+
+    for widget_data in _iter_widget_json(page):
+        cell = widget_data.get("cellTrackingInfo")
+        if isinstance(cell, dict):
+            found.append(cell)
+            product = cell.get("product")
+            if isinstance(product, dict):
+                found.append(product)
+        product = widget_data.get("product")
+        if isinstance(product, dict):
+            found.append(product)
+        for key in ("trackingInfo", "params"):
+            block = widget_data.get(key)
+            if isinstance(block, dict):
+                found.append(block)
+    return found
+
+
+def parse_description_category_and_type(
+    page: dict[str, Any],
+    page2: dict[str, Any] | None = None,
+) -> tuple[str | None, str | None]:
+    """从 PDP 追踪信息中提取 Seller API 所需的 description_category_id / type_id。"""
+    description_category_id: str | None = None
+    type_id: str | None = None
+
+    category_keys = (
+        "description_category_id",
+        "descriptionCategoryId",
+        "descriptionCategoryID",
+        "categoryId",
+        "category_id",
+    )
+    type_keys = ("type_id", "typeId", "typeID", "descriptionTypeId", "description_type_id")
+
+    for source_page in (page, page2):
+        if not source_page:
+            continue
+        for payload in _iter_tracking_dicts(source_page):
+            if description_category_id is None:
+                description_category_id = _pick_id(payload, category_keys)
+            if type_id is None:
+                type_id = _pick_id(payload, type_keys)
+            if description_category_id and type_id:
+                return description_category_id, type_id
+
+    # 面包屑链接里的数字可作为兜底类目 ID（不一定等于 description_category_id）
+    if description_category_id is None:
+        crumbs = widget(page, "breadCrumbs") or {}
+        for item in crumbs.get("breadcrumbs") or crumbs.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            link = (
+                item.get("link")
+                or item.get("url")
+                or ((item.get("action") or {}).get("link") if isinstance(item.get("action"), dict) else None)
+            )
+            if not link:
+                continue
+            match = re.search(r"/category/[^/]*?(\d{3,})/?", str(link))
+            if match:
+                description_category_id = match.group(1)
+                break
+
+    return description_category_id, type_id
+
+
 def _extract_rich_annotation_text(raw: Any) -> str:
     if raw is None:
         return ""
@@ -403,6 +501,7 @@ def parse_product_details(base_page: dict[str, Any], page2: dict[str, Any] | Non
 
     description = parse_description(page2) or parse_description(base_page)
     category_name = parse_category_name(base_page)
+    description_category_id, type_id = parse_description_category_and_type(base_page, page2)
     size, weight = derive_size_and_weight(attributes)
 
     price = price_to_number((price_widget or {}).get("cardPrice"))
@@ -429,6 +528,8 @@ def parse_product_details(base_page: dict[str, Any], page2: dict[str, Any] | Non
         "description": description,
         "attributes": attributes,
         "category_name": category_name,
+        "description_category_id": description_category_id,
+        "type_id": type_id,
         "size": size,
         "weight": weight,
     }

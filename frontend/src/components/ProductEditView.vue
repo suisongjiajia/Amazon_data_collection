@@ -4,7 +4,7 @@ import { computed, ref } from "vue";
 import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
-import type { AiProductEditResponse, OzonProductFamily, ProductEdit } from "../types/ozon-workflow";
+import type { AiProductEditResponse, ListingPreview, OzonProductFamily, ProductEdit } from "../types/ozon-workflow";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -12,6 +12,7 @@ import ErpEmpty from "./erp/ErpEmpty.vue";
 import ErpPageHeader from "./erp/ErpPageHeader.vue";
 import ErpProductCell from "./erp/ErpProductCell.vue";
 import ErpStatGrid from "./erp/ErpStatGrid.vue";
+import ListingPreviewPanel from "./ListingPreviewPanel.vue";
 
 interface EditDraftVariant {
   id: number | null;
@@ -40,6 +41,8 @@ const selectedFamilyId = ref<number | null>(null);
 const draft = ref<EditDraft | null>(null);
 const saving = ref(false);
 const aiGenerating = ref(false);
+const buildingListing = ref(false);
+const listingPreview = ref<ListingPreview | null>(null);
 
 const editByFamily = computed(() => {
   const map = new Map<number, ProductEdit>();
@@ -81,6 +84,10 @@ const attributeEntries = computed(() => {
   return Object.entries(draft.value.attributes);
 });
 
+const otherAttributeEntries = computed(() =>
+  attributeEntries.value.filter(([key]) => key !== "description_category_id" && key !== "type_id"),
+);
+
 const isUnsavedDraft = computed(() => draft.value != null && draft.value.editId == null);
 
 function productPrice(item: OzonProductFamily): string {
@@ -103,13 +110,18 @@ function hasPersistedEdit(familyId: number): boolean {
 }
 
 function canCancelEdit(status: string | null): boolean {
-  return status == null || status === "draft" || status === "editing" || status === "rejected";
+  return status == null || status === "draft" || status === "editing" || status === "rejected" || status === "listing_ready";
 }
 
 function canSubmitReview(draftValue: EditDraft): boolean {
   if (!draftValue.editId) return false;
+  return draftValue.status === "listing_ready";
+}
+
+function canBuildListing(draftValue: EditDraft): boolean {
+  if (!draftValue.editId) return false;
   const status = draftValue.status ?? "draft";
-  return status === "draft" || status === "editing" || status === "rejected";
+  return status === "draft" || status === "editing" || status === "rejected" || status === "listing_ready";
 }
 
 function buildDraftFromProduct(product: OzonProductFamily): EditDraft {
@@ -121,7 +133,7 @@ function buildDraftFromProduct(product: OzonProductFamily): EditDraft {
           sku: `OZON-${product.external_id || variant.id}`,
           title: variant.title || defaultTitle,
           price: parsePrice(variant.price_text),
-          quantity: 0,
+          quantity: 99,
         }))
       : [
           {
@@ -129,7 +141,7 @@ function buildDraftFromProduct(product: OzonProductFamily): EditDraft {
             sku: `OZON-${product.external_id || product.id}`,
             title: defaultTitle,
             price: parsePrice(product.price_text || product.variants?.[0]?.price_text),
-            quantity: 0,
+            quantity: 99,
           },
         ];
 
@@ -143,7 +155,10 @@ function buildDraftFromProduct(product: OzonProductFamily): EditDraft {
     description: "",
     bullet_points: [],
     images,
-    attributes: {},
+    attributes: {
+      description_category_id: product.category_id || "",
+      type_id: product.type_id || "",
+    },
     listing_notes: "",
     variants,
   };
@@ -158,7 +173,11 @@ function buildDraftFromEdit(edit: ProductEdit): EditDraft {
     description: edit.description || "",
     bullet_points: edit.bullet_points || [],
     images: edit.images || [],
-    attributes: edit.attributes || {},
+    attributes: {
+      description_category_id: "",
+      type_id: "",
+      ...(edit.attributes || {}),
+    },
     listing_notes: "",
     variants: edit.variants.map((variant) => ({
       id: variant.id,
@@ -178,7 +197,17 @@ function applyAiSuggestion(response: AiProductEditResponse): void {
   current.description = suggestion.description || current.description;
   current.bullet_points = suggestion.bullet_points || [];
   current.images = suggestion.images?.length ? suggestion.images : current.images;
-  current.attributes = suggestion.attributes || {};
+  current.attributes = {
+    ...current.attributes,
+    ...(suggestion.attributes || {}),
+  };
+  // 采集到的上架 ID 优先保留
+  for (const key of ["description_category_id", "type_id"] as const) {
+    const existing = current.attributes[key];
+    const incoming = suggestion.attributes?.[key];
+    if (existing) current.attributes[key] = existing;
+    else if (incoming) current.attributes[key] = incoming;
+  }
   current.listing_notes = suggestion.listing_notes || "";
 
   if (suggestion.variants?.length) {
@@ -202,14 +231,77 @@ async function generateWithAi(): Promise<void> {
   try {
     const response = await apiRequest<AiProductEditResponse>("/api/product-edits/ai-generate", {
       method: "POST",
-      body: JSON.stringify({ raw_product_family_id: current.rawProductFamilyId }),
+      body: JSON.stringify({
+        raw_product_family_id: current.rawProductFamilyId,
+        rehost_images: true,
+      }),
     });
     applyAiSuggestion(response);
-    store.showNotice("AI 已生成上架内容，请检查后保存");
+    const hints: string[] = ["AI 已生成上架内容"];
+    if (response.pricing) hints.push("价格已按公式计算");
+    if (response.image_rehost?.count) hints.push(`图片已转存 ${response.image_rehost.count} 张`);
+    if (response.suggestion.attributes?.pricing_error) {
+      hints.push(`定价警告: ${response.suggestion.attributes.pricing_error}`);
+    }
+    if (response.suggestion.attributes?.image_rehost_error) {
+      hints.push(`图片转存警告: ${response.suggestion.attributes.image_rehost_error}`);
+    }
+    store.showNotice(hints.join("；") + "，请检查后保存");
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
   } finally {
     aiGenerating.value = false;
+  }
+}
+
+async function suggestPrice(): Promise<void> {
+  const current = draft.value;
+  if (!current) return;
+  try {
+    const result = await apiRequest<{
+      pricing: { price_rub: number; stock_qty: number; formula: string };
+      listing_notes?: string;
+      freight?: { channel_name: string; freight_cny: number };
+    }>("/api/product-edits/suggest-price", {
+      method: "POST",
+      body: JSON.stringify({ raw_product_family_id: current.rawProductFamilyId }),
+    });
+    for (const variant of current.variants) {
+      variant.price = result.pricing.price_rub;
+      variant.quantity = result.pricing.stock_qty;
+    }
+    current.attributes = {
+      ...current.attributes,
+      pricing_formula: result.pricing.formula,
+      freight_channel: result.freight?.channel_name || "",
+      freight_cny: String(result.freight?.freight_cny ?? ""),
+    };
+    if (result.listing_notes) current.listing_notes = result.listing_notes;
+    store.showNotice(`建议价 ${result.pricing.price_rub}₽，库存 ${result.pricing.stock_qty}`);
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function rehostImages(): Promise<void> {
+  const current = draft.value;
+  if (!current) return;
+  try {
+    const result = await apiRequest<{ images: string[]; count: number }>(
+      "/api/product-edits/rehost-images",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          raw_product_family_id: current.rawProductFamilyId,
+          images: current.images,
+          sku: current.variants[0]?.sku,
+        }),
+      },
+    );
+    current.images = result.images;
+    store.showNotice(`已转存 ${result.count} 张图片到 OSS`);
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
   }
 }
 
@@ -219,11 +311,30 @@ function openEdit(familyId: number): void {
   selectedFamilyId.value = familyId;
   const existing = editForFamily(familyId);
   draft.value = existing ? buildDraftFromEdit(existing) : buildDraftFromProduct(product);
+  listingPreview.value = null;
+  if (existing?.listing_payload) {
+    listingPreview.value = {
+      ok: true,
+      issues: existing.listing_payload.issues || [],
+      summary: existing.listing_payload.summary || {
+        title: existing.title,
+        description: existing.description,
+        bullet_points: existing.bullet_points || [],
+        images: existing.images || [],
+        variants: existing.variants,
+      },
+      payload_items: existing.listing_payload.payload_items || [],
+      stock_items: existing.listing_payload.stock_items || [],
+      saved_listing: existing.listing_payload,
+      listing_built_at: existing.listing_built_at,
+    };
+  }
 }
 
 function closeEdit(): void {
   selectedFamilyId.value = null;
   draft.value = null;
+  listingPreview.value = null;
 }
 
 async function cancelEdit(): Promise<void> {
@@ -306,11 +417,12 @@ async function saveEdit(): Promise<void> {
       });
     }
 
-    store.showNotice("已保存到数据库");
+    store.showNotice("产品信息已保存（尚未生成 Listing）");
     await store.refreshAll();
     const fresh = editForFamily(current.rawProductFamilyId);
     if (fresh) {
       draft.value = buildDraftFromEdit(fresh);
+      listingPreview.value = null;
     }
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
@@ -319,15 +431,47 @@ async function saveEdit(): Promise<void> {
   }
 }
 
+async function buildListing(): Promise<void> {
+  const current = draft.value;
+  if (!current?.editId) {
+    store.showError("请先保存产品信息，再生成 Listing");
+    return;
+  }
+  buildingListing.value = true;
+  try {
+    const result = await apiRequest<ListingPreview & { edit?: ProductEdit; saved?: boolean }>(
+      `/api/product-edits/${current.editId}/build-listing`,
+      { method: "POST" },
+    );
+    listingPreview.value = result;
+    if (!result.ok) {
+      store.showError("Listing 校验未通过，请根据下方问题修复后再生成");
+      return;
+    }
+    store.showNotice("Listing 已生成并通过校验，可提交审核");
+    await store.refreshAll();
+    const fresh = editForFamily(current.rawProductFamilyId);
+    if (fresh) draft.value = buildDraftFromEdit(fresh);
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    buildingListing.value = false;
+  }
+}
+
 async function submitReview(): Promise<void> {
   const current = draft.value;
   if (!current?.editId) {
-    store.showError("请先保存编辑内容后再提交审核");
+    store.showError("请先保存并生成 Listing");
+    return;
+  }
+  if (current.status !== "listing_ready") {
+    store.showError("请先生成 Listing 并通过校验后再提交审核");
     return;
   }
   try {
     await apiRequest(`/api/product-edits/${current.editId}/submit-review`, { method: "POST" });
-    store.showNotice("已提交审核");
+    store.showNotice("Listing 已提交审核");
     await store.refreshAll();
     const fresh = editForFamily(current.rawProductFamilyId);
     if (fresh) draft.value = buildDraftFromEdit(fresh);
@@ -344,8 +488,8 @@ async function submitReview(): Promise<void> {
       :description="
         selectedFamilyId
           ? isUnsavedDraft
-            ? '当前为本地草稿，点击保存后才会写入数据库'
-            : '编辑该 Ozon 商品；可用 AI 生成俄语上架内容，保存后提交审核'
+            ? '当前为本地草稿：先保存产品信息，再生成 Listing，最后提交审核'
+            : '先保存产品信息 → 生成可上架 Listing → 提交审核'
           : module.description
       "
     >
@@ -389,7 +533,7 @@ async function submitReview(): Promise<void> {
                   <ErpProductCell
                     :image-url="item.main_image_url"
                     :title="item.title"
-                    :subtitle="`SKU ${item.external_id || '-'}`"
+                    :subtitle="`SKU ${item.external_id || '-'} · ${productPrice(item)}`"
                   />
                 </td>
                 <td>{{ productPrice(item) }}</td>
@@ -443,16 +587,36 @@ async function submitReview(): Promise<void> {
         </div>
       </ErpCard>
 
-      <ErpCard title="编辑内容" description="AI 生成后请检查并保存，才会写入数据库">
+      <ErpCard title="产品信息" description="此处保存的是产品内容；上架包请点「生成 Listing」">
         <div class="erp-editor-actions" style="margin-bottom: 14px">
           <ErpButton :disabled="aiGenerating || saving" @click="generateWithAi">
             {{ aiGenerating ? "AI 生成中…" : "AI 一键生成" }}
           </ErpButton>
+          <ErpButton variant="secondary" :disabled="saving" @click="suggestPrice">计算建议价</ErpButton>
+          <ErpButton variant="secondary" :disabled="saving" @click="rehostImages">图片转存 OSS</ErpButton>
         </div>
         <div class="erp-editor-grid">
           <label class="erp-field">
             <span>标题（俄语）</span>
             <input v-model="draft.title" type="text" />
+          </label>
+          <label class="erp-field">
+            <span>description_category_id（叶子类目）</span>
+            <input
+              v-model="draft.attributes.description_category_id"
+              type="text"
+              inputmode="numeric"
+              placeholder="例如 99447970"
+            />
+          </label>
+          <label class="erp-field">
+            <span>type_id（商品类型）</span>
+            <input
+              v-model="draft.attributes.type_id"
+              type="text"
+              inputmode="numeric"
+              placeholder="例如 970860463"
+            />
           </label>
           <label class="erp-field">
             <span>描述（俄语）</span>
@@ -468,23 +632,24 @@ async function submitReview(): Promise<void> {
           </label>
         </div>
 
-        <div v-if="attributeEntries.length" class="erp-detail-grid" style="margin-top: 14px">
-          <div v-for="[key, value] in attributeEntries" :key="key" class="erp-detail-item">
+        <div v-if="otherAttributeEntries.length" class="erp-detail-grid" style="margin-top: 14px">
+          <div v-for="[key, value] in otherAttributeEntries" :key="key" class="erp-detail-item">
             <span>{{ key }}</span>
             <strong>{{ value }}</strong>
           </div>
         </div>
+        <p
+          v-if="!draft.attributes.description_category_id || !draft.attributes.type_id"
+          class="erp-detail-text"
+          style="margin-top: 12px"
+        >
+          缺少 description_category_id / type_id 时无法生成可上架 Listing。可手动填写，或配置
+          OZON_SELLER_COOKIE 后重新采集自动补全。
+        </p>
 
         <p v-if="draft.listing_notes" class="erp-detail-text" style="margin-top: 14px">
           AI 说明：{{ draft.listing_notes }}
         </p>
-
-        <div class="erp-editor-actions" style="margin-top: 14px">
-          <ErpButton variant="secondary" :disabled="saving" @click="saveEdit">
-            {{ saving ? "保存中…" : "保存" }}
-          </ErpButton>
-          <ErpButton v-if="canSubmitReview(draft)" @click="submitReview">提交审核</ErpButton>
-        </div>
 
         <div class="erp-table-wrap" style="margin-top: 16px">
           <table class="erp-table">
@@ -506,7 +671,24 @@ async function submitReview(): Promise<void> {
             </tbody>
           </table>
         </div>
-        <p class="erp-detail-text" style="margin-top: 12px">保存后变体价格与库存会一并提交；真实上架请在发布模块关闭「模拟发布」。</p>
+
+        <div class="erp-editor-actions" style="margin-top: 14px">
+          <ErpButton variant="secondary" :disabled="saving" @click="saveEdit">
+            {{ saving ? "保存中…" : "保存产品信息" }}
+          </ErpButton>
+          <ErpButton
+            v-if="canBuildListing(draft)"
+            :disabled="buildingListing || saving"
+            @click="buildListing"
+          >
+            {{ buildingListing ? "生成中…" : "生成 Listing" }}
+          </ErpButton>
+          <ErpButton v-if="canSubmitReview(draft)" @click="submitReview">提交审核</ErpButton>
+        </div>
+      </ErpCard>
+
+      <ErpCard v-if="listingPreview" title="Listing 上架包" description="审核与发布将基于此快照">
+        <ListingPreviewPanel :preview="listingPreview" :show-payload="true" />
       </ErpCard>
     </template>
   </div>

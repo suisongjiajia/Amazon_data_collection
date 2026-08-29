@@ -92,6 +92,7 @@ def _build_ozon_families(products: list[OzonProductInfo]) -> list[dict[str, Any]
             "main_image_url": product.main_image_url,
             "sales_rank": product.sales_rank,
             "category_id": product.category_id,
+            "type_id": product.type_id,
             "category_name": product.category_name,
             "hot_score": product.hot_score,
             "variant_dimensions": list(product.variant_attributes.keys()),

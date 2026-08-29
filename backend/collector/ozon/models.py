@@ -24,6 +24,7 @@ class OzonProductInfo:
     source_url: str | None = None
     sales_rank: int | None = None
     category_id: str | None = None
+    type_id: str | None = None
     category_name: str | None = None
     hot_score: float | None = None
     rating: str | None = None
@@ -42,6 +43,7 @@ class OzonProductInfo:
             "sourceUrl": self.source_url,
             "salesRank": self.sales_rank,
             "categoryId": self.category_id,
+            "typeId": self.type_id,
             "categoryName": self.category_name,
             "hotScore": self.hot_score,
             "rating": self.rating,

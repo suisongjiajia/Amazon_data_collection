@@ -13,6 +13,8 @@ from schemas import (
     OzonCollectUrlRequest,
     OzonPublishRequest,
     AiProductEditRequest,
+    SuggestPriceRequest,
+    RehostImagesRequest,
     ProductCreateRequest,
     ProductEditUpdateRequest,
     ProductEditVariantUpdateRequest,
@@ -24,7 +26,11 @@ from schemas import (
 )
 from services import catalog_service, collection_service, draft_service, publish_service
 from services import ozon_collection_service, ozon_publish_service, product_edit_service, review_service, sourcing_service
-from services import ai_product_edit_service
+from services import ai_product_edit_service, ozon_pricing_service
+from integrations.aliyun_oss import rehost_image_urls
+from integrations.aliyun_oss.client import OssError
+from db.ozon_catalog import get_ozon_product_family
+from services.sourcing_service import _enrich_ozon_family_for_display
 
 router = APIRouter(prefix="/api")
 
@@ -293,10 +299,44 @@ def unselect_sourcing_candidate(candidate_id: int) -> dict[str, Any]:
 @router.post("/product-edits/ai-generate")
 def ai_generate_product_edit(request: AiProductEditRequest) -> dict[str, Any]:
     return handle_api_errors(
-        lambda: ai_product_edit_service.generate_product_edit(request.raw_product_family_id),
+        lambda: ai_product_edit_service.generate_product_edit(
+            request.raw_product_family_id,
+            rehost_images=request.rehost_images,
+        ),
         value_error_status=404,
         runtime_error_status=502,
     )
+
+
+@router.post("/product-edits/suggest-price")
+def suggest_product_price(request: SuggestPriceRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_pricing_service.suggest_price_for_family(request.raw_product_family_id),
+        value_error_status=400,
+    )
+
+
+@router.post("/product-edits/rehost-images")
+def rehost_product_images(request: RehostImagesRequest) -> dict[str, Any]:
+    def _action() -> dict[str, Any]:
+        images = list(request.images or [])
+        sku = request.sku or "item"
+        if request.raw_product_family_id is not None:
+            family = get_ozon_product_family(request.raw_product_family_id)
+            product = _enrich_ozon_family_for_display(family)
+            if not images:
+                images = list(product.get("images") or [])
+                if product.get("main_image_url") and product["main_image_url"] not in images:
+                    images = [product["main_image_url"], *images]
+            sku = f"OZON-{product.get('external_id') or request.raw_product_family_id}"
+        if not images:
+            raise ValueError("没有可转存的图片")
+        try:
+            return rehost_image_urls(images, sku=sku)
+        except OssError as exc:
+            raise RuntimeError(str(exc)) from exc
+
+    return handle_api_errors(_action, value_error_status=400, runtime_error_status=502)
 
 
 @router.post("/product-edits")
@@ -343,10 +383,34 @@ def delete_product_edit(edit_id: int) -> dict[str, Any]:
     )
 
 
+@router.post("/product-edits/{edit_id}/build-listing")
+def build_product_edit_listing(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.build_listing(edit_id),
+        value_error_status=400,
+    )
+
+
+@router.get("/product-edits/{edit_id}/listing-preview")
+def preview_product_edit_listing(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.preview_edit_listing(edit_id),
+        value_error_status=404,
+    )
+
+
 @router.post("/product-edits/{edit_id}/submit-review")
 def submit_product_edit_review(edit_id: int) -> dict[str, Any]:
     return handle_api_errors(
         lambda: product_edit_service.submit_for_review(edit_id),
+        value_error_status=400,
+    )
+
+
+@router.post("/product-edits/{edit_id}/reopen")
+def reopen_product_edit(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.reopen_edit(edit_id),
         value_error_status=400,
     )
 
@@ -372,6 +436,14 @@ def update_product_edit_variant(
 @router.get("/reviews")
 def list_reviews(edit_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
     return review_service.list_records(edit_id, limit)
+
+
+@router.get("/reviews/{edit_id}/listing")
+def get_review_listing(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: review_service.get_listing_for_review(edit_id),
+        value_error_status=404,
+    )
 
 
 @router.post("/reviews/{edit_id}/approve")
@@ -406,3 +478,19 @@ def create_ozon_publish_task(request: OzonPublishRequest) -> dict[str, Any]:
 @router.get("/ozon/publish-tasks")
 def list_ozon_publish_tasks(limit: int = 50) -> list[dict[str, Any]]:
     return ozon_publish_service.list_tasks(limit)
+
+
+@router.get("/ozon/publish-tasks/{task_id}")
+def get_ozon_publish_task(task_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_publish_service.get_task(task_id),
+        value_error_status=404,
+    )
+
+
+@router.post("/ozon/publish-tasks/reopen-edit/{edit_id}")
+def reopen_edit_from_publish(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_publish_service.reopen_edit_from_publish(edit_id),
+        value_error_status=400,
+    )

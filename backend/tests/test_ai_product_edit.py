@@ -36,7 +36,8 @@ def test_normalize_ai_result_builds_variants_and_attributes():
     assert len(result["bullet_points"]) == 2
     assert result["attributes"]["category_hint"] == "Авто / Запчасти"
     assert result["variants"][0]["sku"] == "OZON-1002277569"
-    assert result["variants"][0]["price"] == 1599
+    assert result["variants"][0]["price"] is None
+    assert result["variants"][0]["quantity"] == 99
 
 
 def test_generate_product_edit_with_mocked_client(monkeypatch):
@@ -56,13 +57,31 @@ def test_generate_product_edit_with_mocked_client(monkeypatch):
                 "description": "AI Desc",
                 "bullet_points": ["a"],
                 "attributes": {"Brand": "Zekkert"},
-                "variants": [{"price": 1500, "quantity": 5}],
+                "variants": [{"title": "AI Title"}],
             }
 
     monkeypatch.setattr("services.ai_product_edit_service.get_ozon_product_family", lambda _id: family)
     monkeypatch.setattr("services.ai_product_edit_service.list_supplier_candidates", lambda _id, limit=20: [])
     monkeypatch.setattr("services.ai_product_edit_service.DeepSeekClient", lambda: FakeClient())
+    monkeypatch.setattr(
+        "services.ai_product_edit_service._apply_pricing_and_images",
+        lambda family_id, suggestion, rehost_images=True: {
+            "suggestion": {
+                **suggestion,
+                "variants": [
+                    {
+                        **suggestion["variants"][0],
+                        "price": 1500,
+                        "quantity": 99,
+                    }
+                ],
+            },
+            "pricing": None,
+            "image_rehost": None,
+        },
+    )
 
-    result = generate_product_edit(3)
+    result = generate_product_edit(3, rehost_images=False)
     assert result["suggestion"]["title"] == "AI Title"
     assert result["suggestion"]["variants"][0]["price"] == 1500
+    assert result["suggestion"]["variants"][0]["quantity"] == 99
