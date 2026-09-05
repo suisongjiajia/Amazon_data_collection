@@ -56,8 +56,19 @@ class OzonSellerClient:
             data = {"raw": response.text}
 
         if response.status_code >= 400:
-            message = data.get("message") or data.get("error") or response.text[:500]
-            raise OzonSellerError(f"Ozon Seller API 错误 {response.status_code}: {message}")
+            message = ""
+            if isinstance(data, dict):
+                message = str(
+                    data.get("message")
+                    or data.get("error")
+                    or data.get("detail")
+                    or ""
+                ).strip()
+                if not message and isinstance(data.get("result"), dict):
+                    message = str(data["result"].get("message") or "").strip()
+            raise OzonSellerError(
+                f"Ozon Seller API 错误 {response.status_code}: {message or response.text[:500]}"
+            )
 
         return data if isinstance(data, dict) else {"result": data}
 
@@ -68,5 +79,90 @@ class OzonSellerClient:
     def get_import_info(self, task_id: int) -> dict[str, Any]:
         return self.request("POST", "/v1/product/import/info", {"task_id": task_id})
 
+    def get_description_category_attributes(
+        self,
+        *,
+        description_category_id: int,
+        type_id: int,
+        language: str = "DEFAULT",
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/description-category/attribute",
+            {
+                "description_category_id": description_category_id,
+                "type_id": type_id,
+                "language": language,
+            },
+        )
+
+    def get_attribute_values(
+        self,
+        *,
+        attribute_id: int,
+        description_category_id: int,
+        type_id: int,
+        language: str = "DEFAULT",
+        limit: int = 100,
+        last_value_id: int = 0,
+    ) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/v1/description-category/attribute/values",
+            {
+                "attribute_id": attribute_id,
+                "description_category_id": description_category_id,
+                "type_id": type_id,
+                "language": language,
+                "limit": max(1, min(int(limit), 100)),
+                "last_value_id": int(last_value_id or 0),
+            },
+        )
+
+    def search_attribute_values(
+        self,
+        *,
+        attribute_id: int,
+        description_category_id: int,
+        type_id: int,
+        value: str,
+        limit: int = 30,
+    ) -> dict[str, Any]:
+        query = str(value or "").strip()
+        if len(query) < 2:
+            raise OzonSellerError("attribute/values/search 需要至少 2 个字符")
+        return self.request(
+            "POST",
+            "/v1/description-category/attribute/values/search",
+            {
+                "attribute_id": attribute_id,
+                "description_category_id": description_category_id,
+                "type_id": type_id,
+                "value": query,
+                "limit": max(1, min(int(limit), 100)),
+            },
+        )
+
     def update_stocks(self, stocks: list[dict[str, Any]]) -> dict[str, Any]:
         return self.request("POST", "/v2/products/stocks", {"stocks": stocks})
+
+    def generate_barcodes(self, product_ids: list[int | str]) -> dict[str, Any]:
+        ids = [str(pid).strip() for pid in product_ids if str(pid).strip()]
+        if not ids:
+            raise OzonSellerError("generate_barcodes 需要至少一个 product_id")
+        return self.request("POST", "/v1/barcode/generate", {"product_ids": ids[:100]})
+
+    def get_product_info_list(
+        self,
+        *,
+        offer_ids: list[str] | None = None,
+        product_ids: list[int | str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if offer_ids:
+            payload["offer_id"] = [str(x).strip() for x in offer_ids if str(x).strip()]
+        if product_ids:
+            payload["product_id"] = [str(x).strip() for x in product_ids if str(x).strip()]
+        if not payload:
+            raise OzonSellerError("get_product_info_list 需要 offer_id 或 product_id")
+        return self.request("POST", "/v3/product/info/list", payload)

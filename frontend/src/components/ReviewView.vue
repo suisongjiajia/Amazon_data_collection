@@ -5,7 +5,7 @@ import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
 import type { ListingPreview, ProductEdit } from "../types/ozon-workflow";
-import { resolveEditImage, resolveEditSubtitle } from "../utils/product-display";
+import { resolveEditImage, resolveEditSubtitle, formatMoney, resolveCurrencyCode } from "../utils/product-display";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -133,7 +133,7 @@ async function reject(): Promise<void> {
                     :subtitle="resolveEditSubtitle(edit)"
                   />
                 </td>
-                <td>{{ edit.variants?.[0]?.price ?? "-" }}₽</td>
+                <td>{{ formatMoney(edit.variants?.[0]?.price, resolveCurrencyCode(edit.attributes)) }}</td>
               </tr>
             </tbody>
           </table>

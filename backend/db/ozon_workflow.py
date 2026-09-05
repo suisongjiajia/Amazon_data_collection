@@ -155,7 +155,14 @@ def update_supplier_candidate_status(candidate_id: int, status: str) -> dict[str
 
 def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
     from db.ozon_catalog import get_ozon_product_family
+    from services.ozon_category_resolve_service import resolve_category_for_family
     from services.ozon_pricing_service import DEFAULT_STOCK_QTY, suggest_price_for_family
+
+    # 创建编辑前尽量自动补全类目/类型，避免手填
+    try:
+        resolve_category_for_family(raw_product_family_id, force=False)
+    except Exception:
+        pass
 
     family = get_ozon_product_family(raw_product_family_id)
     raw = family.get("raw_payload") or {}
@@ -187,9 +194,10 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
     initial_price = None
     try:
         priced = suggest_price_for_family(raw_product_family_id)
-        initial_price = priced["pricing"]["price_rub"]
+        initial_price = priced["pricing"]["list_price"]
         initial_qty = priced["pricing"]["stock_qty"]
         attributes["pricing_formula"] = priced["pricing"]["formula"]
+        attributes["currency_code"] = priced["pricing"]["currency_code"]
         attributes["freight_channel"] = priced["freight"]["channel_name"]
         attributes["freight_cny"] = str(priced["freight"]["freight_cny"])
     except Exception as exc:

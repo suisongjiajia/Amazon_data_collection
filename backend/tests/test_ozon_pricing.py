@@ -14,8 +14,9 @@ def test_calc_xingyuan_economy_freight():
     assert result["freight_cny"] == round(3.37 + 0.0281 * 200, 2)
 
 
-def test_pricing_formula_a():
-    # (60+40)*1.3/0.8 * 12 = 100*1.625*12 = 1950
+def test_pricing_formula_a(monkeypatch):
+    # (60+40)*1.3/0.8 = 162.5 CNY；×12 = 1950 RUB
+    monkeypatch.setenv("OZON_CURRENCY_CODE", "CNY")
     result = calc_suggested_price_rub(
         supplier_price_cny=60,
         freight_cny=40,
@@ -23,5 +24,19 @@ def test_pricing_formula_a():
         profit_markup=1.30,
         rub_per_cny=12,
     )
+    assert result["price_cny_int"] == 162
     assert result["price_rub"] == 1950
+    assert result["list_price"] == 162
+    assert result["currency_code"] == "CNY"
     assert result["stock_qty"] == 99 or result["stock_qty"] > 0
+
+    monkeypatch.setenv("OZON_CURRENCY_CODE", "RUB")
+    rub = calc_suggested_price_rub(
+        supplier_price_cny=60,
+        freight_cny=40,
+        commission_rate=0.20,
+        profit_markup=1.30,
+        rub_per_cny=12,
+    )
+    assert rub["list_price"] == 1950
+    assert rub["currency_code"] == "RUB"

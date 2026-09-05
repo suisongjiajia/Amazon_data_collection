@@ -1,5 +1,23 @@
 import type { OzonPublishTask, ProductEdit } from "../types/ozon-workflow";
 
+export function resolveCurrencyCode(
+  attributes?: Record<string, string> | null,
+  fallback = "CNY",
+): string {
+  const raw = String(attributes?.currency_code || "").trim().toUpperCase();
+  return raw || fallback;
+}
+
+export function formatMoney(
+  price: number | string | null | undefined,
+  currencyCode = "CNY",
+): string {
+  if (price == null || price === "") return "-";
+  const code = (currencyCode || "CNY").toUpperCase();
+  const symbol = code === "RUB" ? "₽" : code === "CNY" ? "¥" : `${code} `;
+  return `${price}${symbol === `${code} ` ? ` ${code}` : symbol}`;
+}
+
 export function resolveEditImage(edit: Pick<ProductEdit, "images" | "family_main_image_url" | "variants">): string | null {
   const fromImages = edit.images?.find((url) => typeof url === "string" && url.trim());
   if (fromImages) return fromImages;
@@ -14,7 +32,9 @@ export function resolveEditSubtitle(edit: ProductEdit): string {
     parts.push(`源品 ${edit.family_title}`);
   }
   const price = edit.variants?.[0]?.price;
-  if (price != null) parts.push(`${price}₽`);
+  if (price != null) {
+    parts.push(formatMoney(price, resolveCurrencyCode(edit.attributes)));
+  }
   parts.push(`${edit.variants?.length || 0} SKU`);
   return parts.join(" · ");
 }

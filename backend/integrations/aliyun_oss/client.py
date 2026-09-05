@@ -68,8 +68,11 @@ class AliyunOssClient:
         key = key.lstrip("/")
         date = format_datetime(datetime.now(timezone.utc), usegmt=True)
         content_md5 = base64.b64encode(hashlib.md5(data).digest()).decode("ascii")
+        # 对象设为 public-read，否则浏览器/Ozon 拉图会 AccessDenied
+        oss_acl = "public-read"
         canonical = (
-            f"PUT\n{content_md5}\n{content_type}\n{date}\n/{self.bucket}/{key}"
+            f"PUT\n{content_md5}\n{content_type}\n{date}\n"
+            f"x-oss-object-acl:{oss_acl}\n/{self.bucket}/{key}"
         )
         signature = base64.b64encode(
             hmac.new(
@@ -83,6 +86,7 @@ class AliyunOssClient:
             "Date": date,
             "Content-Type": content_type,
             "Content-MD5": content_md5,
+            "x-oss-object-acl": oss_acl,
             "Authorization": f"OSS {self.access_key_id}:{signature}",
         }
         response = requests.put(url, data=data, headers=headers, timeout=60)

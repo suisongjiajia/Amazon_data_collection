@@ -4,8 +4,8 @@ import { computed, ref, watch } from "vue";
 import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
-import type { OzonPublishTask, ProductEdit } from "../types/ozon-workflow";
-import { resolveEditImage, resolveEditSubtitle, resolvePublishTaskImage } from "../utils/product-display";
+import type { ListingPreview, OzonPublishTask, ProductEdit } from "../types/ozon-workflow";
+import { resolveEditImage, resolveEditSubtitle, resolvePublishTaskImage, formatMoney, resolveCurrencyCode } from "../utils/product-display";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -18,10 +18,11 @@ import ListingPreviewPanel from "./ListingPreviewPanel.vue";
 const store = useAppStore();
 const module = getModuleDefinition("ozon-publish");
 const shopName = ref("演示店铺");
-const simulatePublish = ref(true);
+const simulatePublish = ref(false);
 const selectedTaskId = ref<number | null>(null);
 const taskDetail = ref<OzonPublishTask | null>(null);
 const selectedEditId = ref<number | null>(null);
+const refreshing = ref(false);
 
 const approvedEdits = computed(() =>
   store.state.value.edits.filter((item) => item.status === "approved"),
@@ -29,6 +30,17 @@ const approvedEdits = computed(() =>
 
 const failedTasks = computed(() =>
   store.state.value.publishTasks.filter((item) => item.status === "failed"),
+);
+
+const pendingConfirmTasks = computed(() =>
+  store.state.value.publishTasks.filter(
+    (item) =>
+      item.status === "awaiting_pull" ||
+      item.status === "submitted" ||
+      item.status === "running" ||
+      item.status === "pushed" ||
+      item.status === "partial",
+  ),
 );
 
 const selectedEdit = computed(() =>
@@ -50,6 +62,36 @@ watch(
   { immediate: true },
 );
 
+function canRefresh(task: OzonPublishTask): boolean {
+  return [
+    "awaiting_pull",
+    "submitted",
+    "running",
+    "processing",
+    "pushed",
+    "partial",
+    "failed",
+    "listed",
+    "completed",
+  ].includes(task.status);
+}
+
+function resultLabel(task: OzonPublishTask): string {
+  if (task.status === "awaiting_pull" || task.status === "submitted" || task.status === "running") {
+    return `待拉取 ${task.total_count}`;
+  }
+  if (task.status === "pushed" || task.status === "partial") {
+    return `已推送（待可售） ${task.total_count}`;
+  }
+  if (task.status === "listed" || task.status === "completed") {
+    return `上架成功 ${task.success_count}/${task.total_count}`;
+  }
+  if (task.status === "failed") {
+    return `推送失败 ${task.fail_count}/${task.total_count}`;
+  }
+  return `${task.success_count} 成功 / ${task.fail_count} 其它 / ${task.total_count}`;
+}
+
 async function publish(editId: number): Promise<void> {
   try {
     const task = await apiRequest<OzonPublishTask>("/api/ozon/publish-tasks", {
@@ -60,7 +102,11 @@ async function publish(editId: number): Promise<void> {
         simulate: simulatePublish.value,
       }),
     });
-    store.showNotice(simulatePublish.value ? "模拟发布完成" : "已提交 Ozon 发布");
+    store.showNotice(
+      simulatePublish.value
+        ? "模拟任务已推送，状态为「待拉取」，请点击「拉取上架状态」"
+        : "已推送到 Ozon（待拉取）。请点击「拉取上架状态」确认是否可售，并自动生成条码",
+    );
     await store.refreshAll();
     await openTask(task.id);
   } catch (err) {
@@ -76,6 +122,35 @@ async function openTask(taskId: number): Promise<void> {
   } catch (err) {
     taskDetail.value = store.state.value.publishTasks.find((item) => item.id === taskId) ?? null;
     store.showError(err instanceof Error ? err.message : String(err));
+  }
+}
+
+async function refreshStatus(): Promise<void> {
+  if (selectedTaskId.value == null) return;
+  refreshing.value = true;
+  try {
+    const task = await apiRequest<OzonPublishTask>(
+      `/api/ozon/publish-tasks/${selectedTaskId.value}/refresh-status`,
+      { method: "POST" },
+    );
+    taskDetail.value = task;
+    if (task.status === "listed" || task.status === "completed") {
+      store.showNotice("拉取完成：上架成功（可售）");
+    } else if (task.status === "failed") {
+      store.showError(task.error_message || "拉取完成：推送失败，请查看明细");
+    } else if (task.status === "pushed" || task.status === "partial") {
+      store.showNotice(task.error_message || "已推送：商品在 Ozon 但尚不可售，请检查库存/校验后再次拉取");
+    } else if (task.status === "awaiting_pull" || task.status === "submitted") {
+      store.showNotice("仍待拉取：Ozon 还在处理，请稍后再拉");
+    } else {
+      store.showNotice(`当前状态：${task.status}`);
+    }
+    await store.refreshAll();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+    await store.refreshAll();
+  } finally {
+    refreshing.value = false;
   }
 }
 
@@ -96,7 +171,17 @@ async function reopenEdit(editId: number): Promise<void> {
   }
 }
 
-function payloadPreview(task: OzonPublishTask) {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function payloadPreview(task: OzonPublishTask): ListingPreview {
+  const payloads = task.items
+    .map((item) => asRecord(item.submission_payload))
+    .filter((item): item is Record<string, unknown> => Boolean(item));
+  const first = payloads[0] || {};
   const images: string[] = [];
   const main = resolvePublishTaskImage(task);
   if (main) images.push(main);
@@ -105,27 +190,72 @@ function payloadPreview(task: OzonPublishTask) {
       if (typeof url === "string" && url && !images.includes(url)) images.push(url);
     }
   }
+  const payloadImages = first.images;
+  if (Array.isArray(payloadImages)) {
+    for (const url of payloadImages) {
+      if (typeof url === "string" && url && !images.includes(url)) images.push(url);
+    }
+  }
+
   const summary = {
-    title: task.edit_title,
-    description: "",
+    title: String(first.name || task.edit_title || ""),
+    description: String(first.description || ""),
     bullet_points: [] as string[],
     images,
-    variants: task.items.map((item) => ({
-      sku: item.seller_sku,
-      title: item.seller_sku,
-      price: null,
-      quantity: null,
-    })),
+    description_category_id: (first.description_category_id as string | number | null) ?? null,
+    type_id: (first.type_id as string | number | null) ?? null,
+    fulfillment: "rFBS",
+    brand_mode: "no_brand",
+    variants: task.items.map((item) => {
+      const payload = asRecord(item.submission_payload) || {};
+      return {
+        sku: item.seller_sku,
+        title: String(payload.name || item.seller_sku),
+        price:
+          payload.price != null && payload.price !== ""
+            ? Number(payload.price)
+            : null,
+        quantity:
+          payload.quantity != null && payload.quantity !== ""
+            ? Number(payload.quantity)
+            : null,
+      };
+    }),
   };
+
+  const issues = [];
+  if (task.error_message) {
+    issues.push({
+      code: "PUBLISH_ERROR",
+      severity: "error" as const,
+      message: task.error_message,
+    });
+  }
+  for (const item of task.items) {
+    if (item.status !== "failed") continue;
+    const detail = [item.error_code, item.error_message].filter(Boolean).join(" · ");
+    if (!detail) continue;
+    // 任务级已汇总时避免重复刷屏
+    if (task.error_message && task.error_message.includes(detail)) continue;
+    issues.push({
+      code: item.error_code || "ITEM_IMPORT_ERROR",
+      severity: "error" as const,
+      message: `${item.seller_sku}: ${detail}`,
+    });
+  }
+  if (!first.description_category_id || !first.type_id) {
+    issues.push({
+      code: "MISSING_CATEGORY_TYPE",
+      severity: "error" as const,
+      message: "提交载荷缺少 description_category_id 或 type_id",
+    });
+  }
+
   return {
-    ok: task.status === "completed" || task.status === "submitted",
-    issues: task.error_message
-      ? [{ code: "PUBLISH_ERROR", severity: "error" as const, message: task.error_message }]
-      : [],
+    ok: Boolean(first.description_category_id && first.type_id) && !task.error_message,
+    issues,
     summary,
-    payload_items: task.items
-      .map((item) => item.submission_payload)
-      .filter((item): item is Record<string, unknown> => Boolean(item)),
+    payload_items: payloads,
     stock_items: [],
   };
 }
@@ -138,8 +268,8 @@ function payloadPreview(task: OzonPublishTask) {
     <ErpStatGrid
       :items="[
         { label: '可发布', value: approvedEdits.length, hint: '已通过审核' },
-        { label: '失败任务', value: failedTasks.length, hint: '需修复再推' },
-        { label: '发布任务', value: store.stats.value.publishTasks },
+        { label: '待拉取/已推送', value: pendingConfirmTasks.length, hint: '需拉取确认可售' },
+        { label: '推送失败', value: failedTasks.length, hint: '需修复再推' },
       ]"
     />
 
@@ -154,8 +284,9 @@ function payloadPreview(task: OzonPublishTask) {
           <input v-model="simulatePublish" type="checkbox" />
         </label>
       </div>
-      <p v-if="!simulatePublish" class="erp-detail-text">
-        将使用 .env 中的 OZON_SELLER_CLIENT_ID / OZON_SELLER_API_KEY 调用真实上架接口。
+      <p class="erp-detail-text">
+        状态说明：推送成功→「待拉取」；拉取后有档案但不可售→「已推送」；确认可售→「上架成功」；推送时报错→「推送失败」。
+        拉取时会调用 `/v1/barcode/generate` 生成条码，并尝试推 rFBS 库存。
       </p>
     </ErpCard>
 
@@ -240,7 +371,7 @@ function payloadPreview(task: OzonPublishTask) {
               <tbody>
                 <tr v-for="variant in selectedEdit.variants" :key="variant.id">
                   <td>{{ variant.sku }}</td>
-                  <td>{{ variant.price ?? "-" }}₽</td>
+                  <td>{{ formatMoney(variant.price, resolveCurrencyCode(selectedEdit.attributes)) }}</td>
                   <td>{{ variant.quantity }}</td>
                 </tr>
               </tbody>
@@ -278,7 +409,7 @@ function payloadPreview(task: OzonPublishTask) {
                   />
                 </td>
                 <td><ErpBadge :status="task.status" /></td>
-                <td>{{ task.success_count }} / {{ task.total_count }}</td>
+                <td>{{ resultLabel(task) }}</td>
               </tr>
             </tbody>
           </table>
@@ -286,7 +417,7 @@ function payloadPreview(task: OzonPublishTask) {
         <ErpEmpty v-else message="暂无发布任务" />
       </ErpCard>
 
-      <ErpCard title="任务详情" description="查看报错、提交载荷，并支持回编辑修复后再推">
+      <ErpCard title="任务详情" description="先看明细状态；点「拉取上架状态」确认 Ozon 是否真正成功">
         <template v-if="taskDetail">
           <div class="erp-detail-hero" style="margin-bottom: 12px">
             <ErpProductCell
@@ -299,7 +430,10 @@ function payloadPreview(task: OzonPublishTask) {
               <div class="erp-detail-hero__meta">
                 <ErpBadge :status="taskDetail.status" />
                 <span>{{ taskDetail.shop_name || "-" }}</span>
-                <span v-if="taskDetail.family_external_id">Ozon ID {{ taskDetail.family_external_id }}</span>
+                <span v-if="taskDetail.ozon_import_task_id">
+                  Ozon 任务 {{ taskDetail.ozon_import_task_id }}
+                </span>
+                <span v-if="taskDetail.family_external_id">源 SKU {{ taskDetail.family_external_id }}</span>
               </div>
             </div>
           </div>
@@ -313,7 +447,8 @@ function payloadPreview(task: OzonPublishTask) {
               <thead>
                 <tr>
                   <th>SKU</th>
-                  <th>状态</th>
+                  <th>上架状态</th>
+                  <th>Ozon 商品 ID</th>
                   <th>错误码</th>
                   <th>错误信息</th>
                 </tr>
@@ -322,6 +457,7 @@ function payloadPreview(task: OzonPublishTask) {
                 <tr v-for="item in taskDetail.items" :key="item.id">
                   <td>{{ item.seller_sku }}</td>
                   <td><ErpBadge :status="item.status" /></td>
+                  <td>{{ item.ozon_product_id || "-" }}</td>
                   <td>{{ item.error_code || "-" }}</td>
                   <td>{{ item.error_message || "-" }}</td>
                 </tr>
@@ -331,7 +467,14 @@ function payloadPreview(task: OzonPublishTask) {
 
           <div class="erp-editor-actions" style="margin-top: 12px">
             <ErpButton
-              v-if="taskDetail.status === 'failed' || taskDetail.edit_status === 'approved'"
+              v-if="canRefresh(taskDetail)"
+              :disabled="refreshing"
+              @click="refreshStatus"
+            >
+              {{ refreshing ? "拉取中…" : "拉取上架状态" }}
+            </ErpButton>
+            <ErpButton
+              v-if="taskDetail.status === 'failed' || taskDetail.status === 'pushed' || taskDetail.status === 'partial' || taskDetail.edit_status === 'approved'"
               variant="secondary"
               @click="publish(taskDetail.edit_id)"
             >
@@ -349,8 +492,8 @@ function payloadPreview(task: OzonPublishTask) {
           <div style="margin-top: 16px">
             <ListingPreviewPanel
               :preview="payloadPreview(taskDetail)"
-              :show-payload="true"
-              title="本次提交 Payload"
+              :show-payload="false"
+              title="本次提交内容（类目 / 类型 / 价格 / 库存）"
             />
           </div>
         </template>

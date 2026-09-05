@@ -32,6 +32,13 @@ def _parse_dimensions_from_attributes(attributes: dict[str, Any]) -> tuple[int |
             width = _parse_dimension_mm(value) or width
         if any(alias in lower for alias in ("высота", "height", "高度")):
             height = _parse_dimension_mm(value) or height
+        # 专用字段（商品编辑页）
+        if lower in {"length_mm", "depth_mm"}:
+            depth = _parse_dimension_mm(value) or depth
+        if lower == "width_mm":
+            width = _parse_dimension_mm(value) or width
+        if lower == "height_mm":
+            height = _parse_dimension_mm(value) or height
 
     size_text = attributes.get("size") or attributes.get("尺寸")
     if isinstance(size_text, str) and "×" in size_text:
@@ -48,7 +55,7 @@ def _parse_dimensions_from_attributes(attributes: dict[str, Any]) -> tuple[int |
 def _parse_weight_grams(attributes: dict[str, Any], size_weight: str | None = None) -> int | None:
     for key, value in attributes.items():
         lower = str(key).lower()
-        if any(alias in lower for alias in ("вес", "weight", "重量", "масса")):
+        if lower == "weight_g" or any(alias in lower for alias in ("вес", "weight", "重量", "масса")):
             text = str(value).lower()
             num = _parse_dimension_mm(value)
             if num is None:
@@ -61,6 +68,41 @@ def _parse_weight_grams(attributes: dict[str, Any], size_weight: str | None = No
         if num is not None:
             return num
     return None
+
+
+def read_package_metrics(
+    attributes: dict[str, Any],
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """读取已填写的包裹尺寸/重量，不做任何默认值补齐。"""
+    depth, width, height = _parse_dimensions_from_attributes(attributes)
+    weight = _parse_weight_grams(attributes)
+    return depth, width, height, weight
+
+
+def package_metrics_issues(attributes: dict[str, Any]) -> list[dict[str, Any]]:
+    """缺长宽高或重量时给出明确错误，引导去商品编辑填写。"""
+    depth, width, height, weight = read_package_metrics(attributes)
+    missing: list[str] = []
+    if depth is None:
+        missing.append("长度(mm)")
+    if width is None:
+        missing.append("宽度(mm)")
+    if height is None:
+        missing.append("高度(mm)")
+    if weight is None:
+        missing.append("重量(g)")
+    if not missing:
+        return []
+    return [
+        {
+            "code": "MISSING_PACKAGE_METRICS",
+            "severity": "error",
+            "message": (
+                f"缺少包裹信息：{'、'.join(missing)}。"
+                "请到商品编辑填写真实长宽高与重量后再生成 Listing（不会自动写死默认值）"
+            ),
+        }
+    ]
 
 
 def _as_int_id(value: Any) -> int | None:
@@ -117,7 +159,7 @@ def collect_listing_issues(edit: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "code": "MISSING_CATEGORY_ID",
                 "severity": "error",
-                "message": "缺少 description_category_id，请重新采集或在编辑页手动填写",
+                "message": "缺少 description_category_id；打开编辑或生成 Listing 时会自动获取（需配置 OZON_COOKIE）",
             }
         )
     if type_id is None:
@@ -125,7 +167,7 @@ def collect_listing_issues(edit: dict[str, Any]) -> list[dict[str, Any]]:
             {
                 "code": "MISSING_TYPE_ID",
                 "severity": "error",
-                "message": "缺少 type_id，请重新采集或在编辑页手动填写",
+                "message": "缺少 type_id；打开编辑或生成 Listing 时会自动获取（需配置 OZON_COOKIE）",
             }
         )
 
@@ -156,22 +198,14 @@ def collect_listing_issues(edit: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
-    depth, width, height = _parse_dimensions_from_attributes(attributes)
-    weight = _parse_weight_grams(attributes)
-    if depth is None or width is None or height is None:
+    issues.extend(package_metrics_issues(attributes))
+    missing_attrs = str(attributes.get("missing_required_attributes") or "").strip()
+    if missing_attrs:
         issues.append(
             {
-                "code": "MISSING_DIMENSIONS",
+                "code": "MISSING_REQUIRED_ATTRIBUTES",
                 "severity": "warning",
-                "message": "尺寸不完整，Ozon 可能拒收或部分字段缺失",
-            }
-        )
-    if weight is None:
-        issues.append(
-            {
-                "code": "MISSING_WEIGHT",
-                "severity": "warning",
-                "message": "缺少重量，建议补充后发布",
+                "message": f"仍有必填属性未自动填齐：{missing_attrs}",
             }
         )
     return issues
@@ -206,39 +240,13 @@ def build_listing_summary(edit: dict[str, Any], items: list[dict[str, Any]] | No
     }
 
 
-def preview_listing(edit: dict[str, Any]) -> dict[str, Any]:
-    issues = collect_listing_issues(edit)
-    errors = [item for item in issues if item.get("severity") == "error"]
-    items: list[dict[str, Any]] | None = None
-    stocks: list[dict[str, Any]] | None = None
-    build_error: str | None = None
-
-    if not errors:
-        try:
-            items = build_import_items(edit)
-            warehouse_id = _as_int_id(os.getenv("OZON_WAREHOUSE_ID"))
-            if warehouse_id:
-                stocks = build_stock_items(edit, warehouse_id)
-        except OzonSellerError as exc:
-            build_error = str(exc)
-            issues.append({"code": "BUILD_FAILED", "severity": "error", "message": build_error})
-            errors.append(issues[-1])
-
-    return {
-        "ok": not errors and items is not None,
-        "issues": issues,
-        "summary": build_listing_summary(edit, items),
-        "payload_items": items or [],
-        "stock_items": stocks or [],
-        "build_error": build_error,
-    }
-
-
-def build_import_items(edit: dict[str, Any]) -> list[dict[str, Any]]:
+def build_import_items(
+    edit: dict[str, Any],
+    *,
+    warnings: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     images = [url for url in (edit.get("images") or []) if isinstance(url, str) and url.strip()]
     attributes = edit.get("attributes") or {}
-    depth, width, height = _parse_dimensions_from_attributes(attributes)
-    weight = _parse_weight_grams(attributes)
 
     description_category_id = _as_int_id(
         attributes.get("description_category_id") or attributes.get("category_id")
@@ -246,14 +254,52 @@ def build_import_items(edit: dict[str, Any]) -> list[dict[str, Any]]:
     type_id = _as_int_id(attributes.get("type_id"))
     if description_category_id is None or type_id is None:
         raise OzonSellerError(
-            "缺少 description_category_id 或 type_id，请重新采集或在编辑页手动填写后再发布"
+            "缺少 description_category_id 或 type_id，请配置 OZON_COOKIE 后自动获取"
         )
+
+    depth, width, height, weight = read_package_metrics(attributes)
+    package_errors = package_metrics_issues(attributes)
+    if package_errors:
+        raise OzonSellerError(str(package_errors[0]["message"]))
 
     description = _composed_description(edit)
 
     vat = str(os.getenv("OZON_VAT", "0") or "0").strip() or "0"
-    currency_code = (os.getenv("OZON_CURRENCY_CODE") or "RUB").strip() or "RUB"
-    brand_attribute = _build_no_brand_attribute()
+    currency_code = (os.getenv("OZON_CURRENCY_CODE") or "CNY").strip() or "CNY"
+
+    from services.ozon_attribute_fill import build_ozon_attribute_values
+
+    ozon_attrs, missing_required = build_ozon_attribute_values(
+        description_category_id=description_category_id,
+        type_id=type_id,
+        edit_attributes=attributes,
+        edit_title=str(edit.get("title") or ""),
+        variants=list(edit.get("variants") or []),
+    )
+    # 属性填充可能按官方树校正了类目
+    corrected_category = _as_int_id(
+        attributes.get("description_category_id") or attributes.get("category_id")
+    )
+    if corrected_category is not None:
+        description_category_id = corrected_category
+    if not ozon_attrs:
+        ozon_attrs = [_build_no_brand_attribute()]
+    if missing_required and warnings is not None:
+        from services.ozon_attribute_fill import format_missing_attribute_labels
+
+        msg = format_missing_attribute_labels(missing_required)
+        first_code = str(missing_required[0].get("code") or "MISSING_REQUIRED_ATTRIBUTES")
+        warnings.append(
+            {
+                "code": first_code,
+                "severity": "warning",
+                "message": (
+                    msg
+                    if first_code == "ATTRIBUTE_SCHEMA_FETCH_FAILED"
+                    else f"仍有必填属性未自动填齐：{msg}"
+                ),
+            }
+        )
 
     items: list[dict[str, Any]] = []
     for variant in edit.get("variants") or []:
@@ -273,28 +319,52 @@ def build_import_items(edit: dict[str, Any]) -> list[dict[str, Any]]:
             "price": str(int(price) if float(price).is_integer() else price),
             "vat": vat,
             "currency_code": currency_code,
-            "attributes": [brand_attribute],
+            "attributes": list(ozon_attrs),
             "images": item_images,
+            "depth": depth,
+            "width": width,
+            "height": height,
+            "dimension_unit": "mm",
+            "weight": weight,
+            "weight_unit": "g",
         }
         if item_images:
             item["primary_image"] = item_images[0]
-        if depth is not None:
-            item["depth"] = depth
-        if width is not None:
-            item["width"] = width
-        if height is not None:
-            item["height"] = height
-        if any(key in item for key in ("depth", "width", "height")):
-            item["dimension_unit"] = "mm"
-        if weight is not None:
-            item["weight"] = weight
-            item["weight_unit"] = "g"
         items.append(item)
 
     if not items:
         raise OzonSellerError("没有可发布的 SKU 变体")
     return items
 
+
+def preview_listing(edit: dict[str, Any]) -> dict[str, Any]:
+    issues = collect_listing_issues(edit)
+    errors = [item for item in issues if item.get("severity") == "error"]
+    items: list[dict[str, Any]] | None = None
+    stocks: list[dict[str, Any]] | None = None
+    build_error: str | None = None
+
+    if not errors:
+        try:
+            build_warnings: list[dict[str, Any]] = []
+            items = build_import_items(edit, warnings=build_warnings)
+            issues.extend(build_warnings)
+            warehouse_id = _as_int_id(os.getenv("OZON_WAREHOUSE_ID"))
+            if warehouse_id:
+                stocks = build_stock_items(edit, warehouse_id)
+        except OzonSellerError as exc:
+            build_error = str(exc)
+            issues.append({"code": "BUILD_FAILED", "severity": "error", "message": build_error})
+            errors.append(issues[-1])
+
+    return {
+        "ok": not errors and items is not None,
+        "issues": issues,
+        "summary": build_listing_summary(edit, items),
+        "payload_items": items or [],
+        "stock_items": stocks or [],
+        "build_error": build_error,
+    }
 
 def build_stock_items(edit: dict[str, Any], warehouse_id: int) -> list[dict[str, Any]]:
     stocks: list[dict[str, Any]] = []

@@ -80,6 +80,30 @@ def list_families(limit: int = 100) -> list[dict[str, Any]]:
     return list_ozon_product_families(limit)
 
 
+def retry_collection_task(task_id: int) -> dict[str, Any]:
+    """按原任务的链接/策略重新发起一次采集（新建任务，不覆盖旧记录）。"""
+    from db.ozon_catalog import get_collection_task
+
+    task = get_collection_task(task_id)
+    strategy_type = str(task.get("strategy_type") or "").strip()
+    params = task.get("strategy_params") if isinstance(task.get("strategy_params"), dict) else {}
+    source_url = str(task.get("source_url") or "").strip()
+
+    if strategy_type in {"url", "product_url"} or source_url:
+        url = str(params.get("url") or source_url or "").strip()
+        if not url:
+            raise ValueError("原任务没有可重试的采集链接")
+        return run_ozon_url_collection(url)
+
+    if not strategy_type:
+        raise ValueError("原任务缺少策略类型，无法重新采集")
+    return run_ozon_collection_task(
+        strategy_type,
+        dict(params),
+        source_url=source_url,
+    )
+
+
 def _build_ozon_families(products: list[OzonProductInfo]) -> list[dict[str, Any]]:
     return [
         {

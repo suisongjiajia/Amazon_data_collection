@@ -14,7 +14,8 @@ def test_parse_resolved_categories_object():
     }
     resolved = parse_resolved_categories_payload(payload, "1873579696")
     assert resolved is not None
-    assert resolved.description_category_id == "99447970"
+    # Seller API 要用 level_3，不是 level_4
+    assert resolved.description_category_id == "83250454"
     assert resolved.type_id == "970860463"
 
 
@@ -33,5 +34,5 @@ def test_parse_resolved_categories_list():
     }
     resolved = parse_resolved_categories_payload(payload, "26720891541")
     assert resolved is not None
-    assert resolved.description_category_id == "200001075"
+    assert resolved.description_category_id == "88280454"
     assert resolved.type_id == "971107021"

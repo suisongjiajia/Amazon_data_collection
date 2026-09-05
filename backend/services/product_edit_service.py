@@ -12,11 +12,19 @@ from db.ozon_workflow import (
     update_product_edit,
     update_product_edit_variant,
 )
+from services.ozon_category_resolve_service import ensure_edit_category_ids
 from services.ozon_listing_payload import preview_listing
 
 
 def create_edit(raw_product_family_id: int) -> dict[str, Any]:
-    return create_product_edit(raw_product_family_id)
+    edit = create_product_edit(raw_product_family_id)
+    try:
+        ensured = ensure_edit_category_ids(int(edit["id"]), force=False)
+        return ensured.get("edit") or get_product_edit(int(edit["id"]))
+    except Exception as exc:
+        attributes = dict(edit.get("attributes") or {})
+        attributes["category_resolve_error"] = str(exc)
+        return update_product_edit(int(edit["id"]), attributes=attributes)
 
 
 def get_edit(edit_id: int) -> dict[str, Any]:
@@ -66,6 +74,10 @@ def update_variant(
 
 
 def preview_edit_listing(edit_id: int) -> dict[str, Any]:
+    try:
+        ensure_edit_category_ids(edit_id, force=False)
+    except Exception:
+        pass
     edit = get_product_edit(edit_id)
     preview = preview_listing(edit)
     return {
@@ -81,6 +93,16 @@ def build_listing(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
     if edit["status"] not in ("draft", "editing", "rejected", "listing_ready"):
         raise ValueError("当前状态不可生成 Listing，请先重新打开编辑")
+
+    try:
+        ensured = ensure_edit_category_ids(edit_id, force=False)
+        edit = ensured.get("edit") or get_product_edit(edit_id)
+    except Exception as exc:
+        raise ValueError(
+            f"自动获取 type_id / description_category_id 失败：{exc}。"
+            "请检查 .env 中 OZON_COOKIE、OZON_SELLER_CLIENT_ID 后重试"
+        ) from exc
+
     preview = preview_listing(edit)
     if not preview["ok"]:
         return {
@@ -107,6 +129,11 @@ def build_listing(edit_id: int) -> dict[str, Any]:
         "edit": updated,
         "saved": True,
     }
+
+
+def resolve_category(edit_id: int, *, force: bool = True) -> dict[str, Any]:
+    """编辑页自动获取类目/类型。"""
+    return ensure_edit_category_ids(edit_id, force=force)
 
 
 def submit_for_review(edit_id: int) -> dict[str, Any]:

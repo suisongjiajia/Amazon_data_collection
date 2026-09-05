@@ -3,6 +3,20 @@ from integrations.ozon_seller.client import OzonSellerError
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _mock_attribute_fill(monkeypatch):
+    def fake_build(*, description_category_id, type_id, edit_attributes, **_kwargs):
+        return (
+            [{"id": 85, "values": [{"dictionary_value_id": 126745801}]}],
+            [],
+        )
+
+    monkeypatch.setattr(
+        "services.ozon_attribute_fill.build_ozon_attribute_values",
+        fake_build,
+    )
+
+
 def test_preview_listing_reports_missing_type_id():
     edit = {
         "title": "x",

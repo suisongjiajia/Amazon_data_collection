@@ -66,12 +66,14 @@ class OzonCollectConfig:
 
     @classmethod
     def defaults(cls) -> OzonCollectConfig:
+        from config import get_ozon_cookie
+
         return cls(
             max_pages=int(os.getenv("OZON_MAX_PAGES", "5")),
             max_products=int(os.getenv("OZON_MAX_PRODUCTS", "200")),
             delay_ms=int(os.getenv("OZON_DELAY_MS", "800")),
             listing_page_delay_ms=int(os.getenv("OZON_LISTING_PAGE_DELAY_MS", "500")),
             timeout_seconds=int(os.getenv("OZON_TIMEOUT_SECONDS", "45")),
-            cookie=os.getenv("OZON_COOKIE", "").strip(),
+            cookie=get_ozon_cookie(),
             impersonate=os.getenv("OZON_IMPERSONATE", "edge101").strip() or "edge101",
         )

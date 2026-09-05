@@ -2,6 +2,7 @@
 import { computed } from "vue";
 
 import { ERP_MODULES, getModuleDefinition } from "../../config/modules";
+import type { OzonHealth } from "../../composables/useAppStore";
 import type { OzonViewKey } from "../../types/ozon-workflow";
 import ErpButton from "./ErpButton.vue";
 
@@ -18,6 +19,7 @@ const props = defineProps<{
   };
   notice?: string;
   error?: string;
+  health?: OzonHealth | null;
 }>();
 
 const emit = defineEmits<{
@@ -36,6 +38,10 @@ const moduleGroups = computed(() => {
   }
   return Array.from(groups.entries());
 });
+
+const failedChecks = computed(() =>
+  (props.health?.checks || []).filter((item) => item.required && !item.ok),
+);
 </script>
 
 <template>
@@ -93,6 +99,16 @@ const moduleGroups = computed(() => {
         </div>
       </header>
 
+      <div v-if="failedChecks.length" class="erp-alert erp-alert--danger">
+        <strong>开店配置未就绪：</strong>
+        {{ health?.summary || failedChecks.map((item) => item.message).join("；") }}
+        <div class="erp-alert__hint">
+          只需维护一套 OZON_COOKIE（采集与类目解析共用）。API 密钥与仓库 ID 仍需在 .env 配置。
+        </div>
+      </div>
+      <div v-else-if="health?.ok" class="erp-alert erp-alert--success">
+        配置体检通过：Cookie / Seller API / 仓库已就绪
+      </div>
       <div v-if="notice" class="erp-alert erp-alert--success">{{ notice }}</div>
       <div v-if="error" class="erp-alert erp-alert--danger">{{ error }}</div>
 
@@ -102,3 +118,11 @@ const moduleGroups = computed(() => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.erp-alert__hint {
+  margin-top: 6px;
+  font-size: 12px;
+  opacity: 0.9;
+}
+</style>

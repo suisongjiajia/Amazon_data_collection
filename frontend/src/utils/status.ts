@@ -6,6 +6,7 @@ export interface StatusMeta {
 const STATUS_MAP: Record<string, StatusMeta> = {
   completed: { label: "已完成", tone: "success" },
   success: { label: "成功", tone: "success" },
+  listed: { label: "上架成功", tone: "success" },
   approved: { label: "已通过", tone: "success" },
   published: { label: "已发布", tone: "success" },
   selected: { label: "已选定", tone: "success" },
@@ -16,8 +17,12 @@ const STATUS_MAP: Record<string, StatusMeta> = {
   candidate: { label: "候选", tone: "muted" },
   draft: { label: "草稿", tone: "muted" },
   editing: { label: "编辑中", tone: "muted" },
-  submitted: { label: "已提交", tone: "info" },
-  failed: { label: "失败", tone: "danger" },
+  awaiting_pull: { label: "待拉取", tone: "info" },
+  submitted: { label: "待拉取", tone: "info" },
+  processing: { label: "待拉取", tone: "info" },
+  pushed: { label: "已推送", tone: "warning" },
+  partial: { label: "已推送", tone: "warning" },
+  failed: { label: "推送失败", tone: "danger" },
   rejected: { label: "已驳回", tone: "danger" },
 };
 

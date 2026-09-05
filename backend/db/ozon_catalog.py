@@ -138,8 +138,12 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
                         review_count = COALESCE(VALUES(review_count), review_count),
                         main_image_url = COALESCE(VALUES(main_image_url), main_image_url),
                         sales_rank = COALESCE(VALUES(sales_rank), sales_rank),
-                        category_id = COALESCE(VALUES(category_id), category_id),
-                        type_id = COALESCE(VALUES(type_id), type_id),
+                        category_id = IF(
+                            VALUES(type_id) IS NOT NULL AND VALUES(type_id) != '',
+                            VALUES(category_id),
+                            category_id
+                        ),
+                        type_id = COALESCE(NULLIF(VALUES(type_id), ''), type_id),
                         category_name = COALESCE(VALUES(category_name), category_name),
                         hot_score = COALESCE(VALUES(hot_score), hot_score),
                         raw_payload = VALUES(raw_payload),

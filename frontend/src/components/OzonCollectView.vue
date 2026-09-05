@@ -4,7 +4,7 @@ import { computed, ref } from "vue";
 import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
-import type { OzonProductFamily } from "../types/ozon-workflow";
+import type { OzonCollectionTask, OzonProductFamily } from "../types/ozon-workflow";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -16,6 +16,8 @@ import ErpStatGrid from "./erp/ErpStatGrid.vue";
 const store = useAppStore();
 const module = getModuleDefinition("ozon-collect");
 const collectionUrl = ref("");
+const collecting = ref(false);
+const retryingTaskId = ref<number | null>(null);
 
 function productCollectUrl(item: Pick<OzonProductFamily, "source_url" | "external_id">): string | null {
   const direct = item.source_url?.trim();
@@ -30,11 +32,25 @@ function truncateUrl(value: string, maxLength = 48): string {
   return `${value.slice(0, maxLength - 1)}…`;
 }
 
+function taskSourceUrl(task: OzonCollectionTask): string {
+  const fromParams =
+    typeof task.strategy_params?.url === "string" ? task.strategy_params.url.trim() : "";
+  return fromParams || task.source_url?.trim() || "";
+}
+
+function canRetry(task: OzonCollectionTask): boolean {
+  return Boolean(taskSourceUrl(task) || task.strategy_type);
+}
+
 const productRows = computed(() =>
   store.state.value.ozonProducts.map((item) => ({
     item,
     collectUrl: productCollectUrl(item),
   })),
+);
+
+const failedTaskCount = computed(
+  () => store.state.value.ozonTasks.filter((task) => task.status === "failed").length,
 );
 
 async function submitCollection(): Promise<void> {
@@ -43,6 +59,7 @@ async function submitCollection(): Promise<void> {
     store.showError("请先输入 Ozon 链接");
     return;
   }
+  collecting.value = true;
   try {
     await apiRequest("/api/ozon/collect", {
       method: "POST",
@@ -53,6 +70,27 @@ async function submitCollection(): Promise<void> {
     await store.refreshAll();
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+    await store.refreshAll();
+  } finally {
+    collecting.value = false;
+  }
+}
+
+async function retryTask(task: OzonCollectionTask): Promise<void> {
+  if (!canRetry(task)) {
+    store.showError("该任务没有可重试的链接或策略");
+    return;
+  }
+  retryingTaskId.value = task.id;
+  try {
+    await apiRequest(`/api/ozon/collections/${task.id}/retry`, { method: "POST" });
+    store.showNotice(`已重新采集：${task.task_no}`);
+    await store.refreshAll();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+    await store.refreshAll();
+  } finally {
+    retryingTaskId.value = null;
   }
 }
 </script>
@@ -65,12 +103,12 @@ async function submitCollection(): Promise<void> {
       :items="[
         { label: '商品总数', value: store.stats.value.products, hint: '已入库 Ozon 商品' },
         { label: '采集任务', value: store.stats.value.collectionTasks, hint: '历史任务' },
-        { label: '货源候选', value: store.stats.value.candidates, hint: '1688 匹配' },
+        { label: '失败任务', value: failedTaskCount, hint: '可点重新采集' },
         { label: '待审商品', value: store.stats.value.pendingReview, hint: '编辑审核' },
       ]"
     />
 
-    <ErpCard title="链接采集" description="粘贴 Ozon 商品或店铺链接。遇 403 请将 Cookie 配置到 .env 的 OZON_COOKIE">
+    <ErpCard title="链接采集" description="粘贴 Ozon 商品或店铺链接。Cookie 只配 .env 的 OZON_COOKIE 一套即可（采集与类目解析共用）">
       <div class="erp-form-row">
         <label class="erp-field erp-field--grow">
           <span>Ozon 链接</span>
@@ -80,8 +118,8 @@ async function submitCollection(): Promise<void> {
             placeholder="https://www.ozon.ru/product/... 或 seller 链接"
           />
         </label>
-        <ErpButton :disabled="store.loading.value" @click="submitCollection">
-          {{ store.loading.value ? "采集中…" : "开始采集" }}
+        <ErpButton :disabled="collecting || store.loading.value" @click="submitCollection">
+          {{ collecting ? "采集中…" : "开始采集" }}
         </ErpButton>
       </div>
     </ErpCard>
@@ -136,17 +174,53 @@ async function submitCollection(): Promise<void> {
           <thead>
             <tr>
               <th>任务编号</th>
+              <th>链接 / 说明</th>
               <th>类型</th>
               <th>状态</th>
               <th>成功 / 总计</th>
+              <th>操作</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="task in store.state.value.ozonTasks" :key="task.id">
               <td>{{ task.task_no }}</td>
+              <td>
+                <div class="task-meta">
+                  <a
+                    v-if="taskSourceUrl(task)"
+                    class="text-link url-cell"
+                    :href="taskSourceUrl(task)"
+                    target="_blank"
+                    rel="noreferrer"
+                    :title="taskSourceUrl(task)"
+                  >
+                    {{ truncateUrl(taskSourceUrl(task), 40) }}
+                  </a>
+                  <span v-else>-</span>
+                  <span v-if="task.error_message" class="task-error" :title="task.error_message">
+                    {{ truncateUrl(task.error_message, 60) }}
+                  </span>
+                </div>
+              </td>
               <td>{{ task.strategy_type }}</td>
               <td><ErpBadge :status="task.status" /></td>
               <td>{{ task.success_count }} / {{ task.total_count }}</td>
+              <td>
+                <ErpButton
+                  size="sm"
+                  variant="secondary"
+                  :disabled="!canRetry(task) || retryingTaskId === task.id || collecting"
+                  @click="retryTask(task)"
+                >
+                  {{
+                    retryingTaskId === task.id
+                      ? "重采中…"
+                      : task.status === "failed"
+                        ? "重新采集"
+                        : "再采一次"
+                  }}
+                </ErpButton>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -155,3 +229,17 @@ async function submitCollection(): Promise<void> {
     </ErpCard>
   </div>
 </template>
+
+<style scoped>
+.task-meta {
+  display: grid;
+  gap: 4px;
+  max-width: 320px;
+}
+
+.task-error {
+  color: #991b1b;
+  font-size: 12px;
+  line-height: 1.4;
+}
+</style>

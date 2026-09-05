@@ -43,6 +43,7 @@ const saving = ref(false);
 const aiGenerating = ref(false);
 const buildingListing = ref(false);
 const listingPreview = ref<ListingPreview | null>(null);
+const resolvingCategory = ref(false);
 
 const editByFamily = computed(() => {
   const map = new Map<number, ProductEdit>();
@@ -84,9 +85,47 @@ const attributeEntries = computed(() => {
   return Object.entries(draft.value.attributes);
 });
 
+const PACKAGE_ATTR_KEYS = ["length_mm", "width_mm", "height_mm", "weight_g"] as const;
+
 const otherAttributeEntries = computed(() =>
-  attributeEntries.value.filter(([key]) => key !== "description_category_id" && key !== "type_id"),
+  attributeEntries.value.filter(
+    ([key]) =>
+      key !== "description_category_id" &&
+      key !== "type_id" &&
+      key !== "category_resolve_error" &&
+      key !== "package_defaults" &&
+      key !== "ozon_auto_attributes" &&
+      !(PACKAGE_ATTR_KEYS as readonly string[]).includes(key),
+  ),
 );
+
+function packageAttr(key: (typeof PACKAGE_ATTR_KEYS)[number]): string {
+  return draft.value?.attributes?.[key] || "";
+}
+
+function setPackageAttr(key: (typeof PACKAGE_ATTR_KEYS)[number], value: string): void {
+  if (!draft.value) return;
+  const text = value.trim();
+  if (!text) {
+    const next = { ...draft.value.attributes };
+    delete next[key];
+    draft.value.attributes = next;
+    return;
+  }
+  draft.value.attributes = { ...draft.value.attributes, [key]: text };
+}
+
+const hasCategoryIds = computed(() => {
+  const attrs = draft.value?.attributes;
+  return Boolean(attrs?.description_category_id && attrs?.type_id);
+});
+
+const priceCurrencyLabel = computed(() => {
+  const code = String(draft.value?.attributes?.currency_code || "CNY").trim().toUpperCase() || "CNY";
+  if (code === "RUB") return "价格 (₽)";
+  if (code === "CNY") return "价格 (¥ / CNY)";
+  return `价格 (${code})`;
+});
 
 const isUnsavedDraft = computed(() => draft.value != null && draft.value.editId == null);
 
@@ -259,25 +298,34 @@ async function suggestPrice(): Promise<void> {
   if (!current) return;
   try {
     const result = await apiRequest<{
-      pricing: { price_rub: number; stock_qty: number; formula: string };
+      pricing: {
+        list_price: number;
+        price_rub: number;
+        currency_code?: string;
+        stock_qty: number;
+        formula: string;
+      };
       listing_notes?: string;
       freight?: { channel_name: string; freight_cny: number };
     }>("/api/product-edits/suggest-price", {
       method: "POST",
       body: JSON.stringify({ raw_product_family_id: current.rawProductFamilyId }),
     });
+    const listPrice = result.pricing.list_price ?? result.pricing.price_rub;
+    const currency = result.pricing.currency_code || "CNY";
     for (const variant of current.variants) {
-      variant.price = result.pricing.price_rub;
+      variant.price = listPrice;
       variant.quantity = result.pricing.stock_qty;
     }
     current.attributes = {
       ...current.attributes,
       pricing_formula: result.pricing.formula,
+      currency_code: currency,
       freight_channel: result.freight?.channel_name || "",
       freight_cny: String(result.freight?.freight_cny ?? ""),
     };
     if (result.listing_notes) current.listing_notes = result.listing_notes;
-    store.showNotice(`建议价 ${result.pricing.price_rub}₽，库存 ${result.pricing.stock_qty}`);
+    store.showNotice(`建议价 ${listPrice} ${currency}，库存 ${result.pricing.stock_qty}`);
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
   }
@@ -328,6 +376,64 @@ function openEdit(familyId: number): void {
       saved_listing: existing.listing_payload,
       listing_built_at: existing.listing_built_at,
     };
+  }
+  void autoResolveCategoryIfNeeded();
+}
+
+async function autoResolveCategoryIfNeeded(): Promise<void> {
+  const current = draft.value;
+  if (!current) return;
+  if (current.attributes.description_category_id && current.attributes.type_id) return;
+  await resolveCategory(false);
+}
+
+async function resolveCategory(showSuccessNotice = true): Promise<void> {
+  const current = draft.value;
+  if (!current) return;
+  resolvingCategory.value = true;
+  try {
+    // 未保存时先按 family 解析；已保存则写入 edit attributes
+    if (!current.editId) {
+      const resolved = await apiRequest<{
+        description_category_id: string;
+        type_id: string;
+      }>(`/api/ozon/products/${current.rawProductFamilyId}/resolve-category`, {
+        method: "POST",
+      });
+      current.attributes.description_category_id = String(resolved.description_category_id);
+      current.attributes.type_id = String(resolved.type_id);
+      delete current.attributes.category_resolve_error;
+      await store.refreshAll();
+      if (showSuccessNotice) {
+        store.showNotice(
+          `已自动获取类目 ${resolved.description_category_id} / type ${resolved.type_id}`,
+        );
+      }
+      return;
+    }
+
+    const result = await apiRequest<{
+      description_category_id: string;
+      type_id: string;
+      edit?: ProductEdit;
+    }>(`/api/product-edits/${current.editId}/resolve-category`, { method: "POST" });
+    current.attributes.description_category_id = String(result.description_category_id);
+    current.attributes.type_id = String(result.type_id);
+    delete current.attributes.category_resolve_error;
+    await store.refreshAll();
+    const fresh = editForFamily(current.rawProductFamilyId);
+    if (fresh) draft.value = buildDraftFromEdit(fresh);
+    if (showSuccessNotice) {
+      store.showNotice(
+        `已自动获取类目 ${result.description_category_id} / type ${result.type_id}`,
+      );
+    }
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (current.attributes) current.attributes.category_resolve_error = message;
+    store.showError(message);
+  } finally {
+    resolvingCategory.value = false;
   }
 }
 
@@ -594,30 +700,27 @@ async function submitReview(): Promise<void> {
           </ErpButton>
           <ErpButton variant="secondary" :disabled="saving" @click="suggestPrice">计算建议价</ErpButton>
           <ErpButton variant="secondary" :disabled="saving" @click="rehostImages">图片转存 OSS</ErpButton>
+          <ErpButton
+            variant="secondary"
+            :disabled="resolvingCategory || saving"
+            @click="resolveCategory(true)"
+          >
+            {{ resolvingCategory ? "获取类目中…" : "自动获取类目" }}
+          </ErpButton>
         </div>
         <div class="erp-editor-grid">
           <label class="erp-field">
             <span>标题（俄语）</span>
             <input v-model="draft.title" type="text" />
           </label>
-          <label class="erp-field">
-            <span>description_category_id（叶子类目）</span>
-            <input
-              v-model="draft.attributes.description_category_id"
-              type="text"
-              inputmode="numeric"
-              placeholder="例如 99447970"
-            />
-          </label>
-          <label class="erp-field">
-            <span>type_id（商品类型）</span>
-            <input
-              v-model="draft.attributes.type_id"
-              type="text"
-              inputmode="numeric"
-              placeholder="例如 970860463"
-            />
-          </label>
+          <div class="erp-detail-item">
+            <span>description_category_id</span>
+            <strong>{{ draft.attributes.description_category_id || "-" }}</strong>
+          </div>
+          <div class="erp-detail-item">
+            <span>type_id</span>
+            <strong>{{ draft.attributes.type_id || "-" }}</strong>
+          </div>
           <label class="erp-field">
             <span>描述（俄语）</span>
             <textarea v-model="draft.description" rows="6" />
@@ -632,19 +735,71 @@ async function submitReview(): Promise<void> {
           </label>
         </div>
 
+        <div class="erp-editor-grid" style="margin-top: 14px">
+          <label class="erp-field">
+            <span>长度 (mm) *</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              :value="packageAttr('length_mm')"
+              @input="setPackageAttr('length_mm', ($event.target as HTMLInputElement).value)"
+              placeholder="必填，真实包裹长度"
+            />
+          </label>
+          <label class="erp-field">
+            <span>宽度 (mm) *</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              :value="packageAttr('width_mm')"
+              @input="setPackageAttr('width_mm', ($event.target as HTMLInputElement).value)"
+              placeholder="必填，真实包裹宽度"
+            />
+          </label>
+          <label class="erp-field">
+            <span>高度 (mm) *</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              :value="packageAttr('height_mm')"
+              @input="setPackageAttr('height_mm', ($event.target as HTMLInputElement).value)"
+              placeholder="必填，真实包裹高度"
+            />
+          </label>
+          <label class="erp-field">
+            <span>重量 (g) *</span>
+            <input
+              type="number"
+              min="1"
+              step="1"
+              :value="packageAttr('weight_g')"
+              @input="setPackageAttr('weight_g', ($event.target as HTMLInputElement).value)"
+              placeholder="必填，真实商品重量"
+            />
+          </label>
+        </div>
+        <p class="erp-detail-text" style="margin-top: 8px">
+          长宽高与重量用于 Ozon 创建 SKU，必须按实货填写；系统不会自动写死默认值。
+        </p>
+
         <div v-if="otherAttributeEntries.length" class="erp-detail-grid" style="margin-top: 14px">
           <div v-for="[key, value] in otherAttributeEntries" :key="key" class="erp-detail-item">
             <span>{{ key }}</span>
             <strong>{{ value }}</strong>
           </div>
         </div>
+        <p v-if="!hasCategoryIds" class="erp-detail-text" style="margin-top: 12px">
+          类目/类型自动获取（需配置 OZON_COOKIE）。打开编辑或生成 Listing 时会自动补全。
+        </p>
         <p
-          v-if="!draft.attributes.description_category_id || !draft.attributes.type_id"
+          v-if="draft.attributes.category_resolve_error"
           class="erp-detail-text"
-          style="margin-top: 12px"
+          style="margin-top: 8px; color: #991b1b"
         >
-          缺少 description_category_id / type_id 时无法生成可上架 Listing。可手动填写，或配置
-          OZON_SELLER_COOKIE 后重新采集自动补全。
+          自动获取失败：{{ draft.attributes.category_resolve_error }}
         </p>
 
         <p v-if="draft.listing_notes" class="erp-detail-text" style="margin-top: 14px">
@@ -657,7 +812,7 @@ async function submitReview(): Promise<void> {
               <tr>
                 <th>SKU</th>
                 <th>变体标题</th>
-                <th>价格 (₽)</th>
+                <th>{{ priceCurrencyLabel }}</th>
                 <th>库存</th>
               </tr>
             </thead>

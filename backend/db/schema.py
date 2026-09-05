@@ -261,6 +261,7 @@ CREATE_TABLE_STATEMENTS = [
         total_count         INT             NOT NULL DEFAULT 0 COMMENT '总条数',
         success_count       INT             NOT NULL DEFAULT 0 COMMENT '成功条数',
         fail_count          INT             NOT NULL DEFAULT 0 COMMENT '失败条数',
+        ozon_import_task_id BIGINT          NULL COMMENT 'Ozon product/import 异步任务 ID',
         error_message       TEXT            NULL COMMENT '错误信息',
         submitted_at        DATETIME        NULL COMMENT '提交时间',
         finished_at         DATETIME        NULL COMMENT '完成时间',

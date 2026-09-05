@@ -36,12 +36,23 @@ router = APIRouter(prefix="/api")
 
 
 @router.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
     try:
-        database.check_db()
+        from db.connection import get_connection
+
+        with get_connection() as connection:
+            with connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
         return {"status": "ok", "database": "connected"}
     except Exception as exc:
         return {"status": "degraded", "database": str(exc)}
+
+
+@router.get("/ozon/health")
+def ozon_health() -> dict[str, Any]:
+    from services.ozon_health_service import get_ozon_runtime_health
+
+    return get_ozon_runtime_health()
 
 
 @router.post("/collect")
@@ -245,9 +256,29 @@ def list_ozon_collections(limit: int = 50) -> list[dict[str, Any]]:
     return ozon_collection_service.list_tasks(limit)
 
 
+@router.post("/ozon/collections/{task_id}/retry")
+def retry_ozon_collection(task_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_collection_service.retry_collection_task(task_id),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
 @router.get("/ozon/products")
 def list_ozon_products(limit: int = 100) -> list[dict[str, Any]]:
     return ozon_collection_service.list_families(limit)
+
+
+@router.post("/ozon/products/{family_id}/resolve-category")
+def resolve_ozon_product_category(family_id: int) -> dict[str, Any]:
+    from services.ozon_category_resolve_service import resolve_category_for_family
+
+    return handle_api_errors(
+        lambda: resolve_category_for_family(family_id, force=True),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
 
 
 @router.post("/sourcing/search")
@@ -391,6 +422,15 @@ def build_product_edit_listing(edit_id: int) -> dict[str, Any]:
     )
 
 
+@router.post("/product-edits/{edit_id}/resolve-category")
+def resolve_product_edit_category(edit_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: product_edit_service.resolve_category(edit_id, force=True),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
 @router.get("/product-edits/{edit_id}/listing-preview")
 def preview_product_edit_listing(edit_id: int) -> dict[str, Any]:
     return handle_api_errors(
@@ -485,6 +525,15 @@ def get_ozon_publish_task(task_id: int) -> dict[str, Any]:
     return handle_api_errors(
         lambda: ozon_publish_service.get_task(task_id),
         value_error_status=404,
+    )
+
+
+@router.post("/ozon/publish-tasks/{task_id}/refresh-status")
+def refresh_ozon_publish_task_status(task_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_publish_service.refresh_import_status(task_id),
+        value_error_status=400,
+        runtime_error_status=502,
     )
 
 

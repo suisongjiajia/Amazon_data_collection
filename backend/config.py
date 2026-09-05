@@ -34,3 +34,29 @@ def get_db_config() -> dict[str, str | int]:
         "database": get_env("DB_NAME"),
         "charset": "utf8mb4",
     }
+
+
+def get_ozon_cookie() -> str:
+    """
+    统一浏览器 Cookie：
+    - 优先 OZON_COOKIE
+    - 若为空则回退 OZON_SELLER_COOKIE（兼容旧配置）
+    采集与卖家后台类目解析默认共用，避免重复粘贴。
+    """
+    primary = (os.getenv("OZON_COOKIE") or "").strip()
+    if primary:
+        return primary
+    return (os.getenv("OZON_SELLER_COOKIE") or "").strip()
+
+
+def get_ozon_seller_ui_cookie() -> str:
+    """卖家后台 UI Cookie：有 OZON_SELLER_COOKIE 覆盖则用覆盖，否则复用 OZON_COOKIE。"""
+    override = (os.getenv("OZON_SELLER_COOKIE") or "").strip()
+    if override:
+        return override
+    return (os.getenv("OZON_COOKIE") or "").strip()
+
+
+def ozon_cookie_configured() -> bool:
+    return bool(get_ozon_cookie())
+

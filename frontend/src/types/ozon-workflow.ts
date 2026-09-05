@@ -11,10 +11,12 @@ export interface OzonCollectionTask {
   task_no: string;
   strategy_type: string;
   strategy_params?: Record<string, unknown> | null;
+  source_url?: string | null;
   status: string;
   total_count: number;
   success_count: number;
   fail_count: number;
+  error_message?: string | null;
   created_at: string;
   finished_at?: string | null;
 }
@@ -212,6 +214,7 @@ export interface OzonPublishTask {
   total_count: number;
   success_count: number;
   fail_count: number;
+  ozon_import_task_id?: number | null;
   error_message?: string | null;
   created_at: string;
   finished_at?: string | null;
@@ -220,6 +223,7 @@ export interface OzonPublishTask {
     seller_sku: string;
     status: string;
     ozon_product_id?: string | null;
+    ozon_offer_id?: string | null;
     error_code?: string | null;
     error_message?: string | null;
     submission_payload?: Record<string, unknown> | null;

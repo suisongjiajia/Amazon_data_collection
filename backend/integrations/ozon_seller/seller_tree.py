@@ -7,6 +7,8 @@ from typing import Any
 
 import requests
 
+from config import get_ozon_seller_ui_cookie
+
 
 class OzonSellerTreeError(RuntimeError):
     pass
@@ -19,13 +21,18 @@ class ResolvedCategory:
     raw: dict[str, Any]
 
 
-def _pick_deepest_category_id(entry: dict[str, Any]) -> str | None:
+def _pick_description_category_id_for_api(entry: dict[str, Any]) -> str | None:
+    """
+    Seller API（attribute / import）需要的是「类型所属类目」，
+    对应 resolve/by-sku 的 level_3；level_4 会报 category ... is not found。
+    """
     for key in (
-        "description_category_id_level_4",
         "description_category_id_level_3",
-        "description_category_id_level_2",
+        "descriptionCategoryIdLevel3",
         "description_category_id",
         "descriptionCategoryId",
+        "description_category_id_level_4",
+        "description_category_id_level_2",
     ):
         value = entry.get(key)
         if value is None or value == "":
@@ -58,7 +65,6 @@ def parse_resolved_categories_payload(
     sku_key = str(sku).strip()
     entry: Any = block.get(sku_key)
     if entry is None:
-        # 兼容偶发数字键（极少见）
         for key, value in block.items():
             if str(key).strip() == sku_key:
                 entry = value
@@ -68,7 +74,7 @@ def parse_resolved_categories_payload(
     if not isinstance(entry, dict):
         return None
 
-    category_id = _pick_deepest_category_id(entry)
+    category_id = _pick_description_category_id_for_api(entry)
     type_id = _pick_type_id(entry)
     if not category_id or not type_id:
         return None
@@ -90,7 +96,7 @@ class OzonSellerTreeClient:
         base_url: str | None = None,
         timeout_seconds: int | None = None,
     ) -> None:
-        self.cookie = (cookie if cookie is not None else os.getenv("OZON_SELLER_COOKIE", "")).strip()
+        self.cookie = (cookie if cookie is not None else get_ozon_seller_ui_cookie()).strip()
         self.company_id = (
             company_id if company_id is not None else os.getenv("OZON_SELLER_CLIENT_ID", "")
         ).strip()
@@ -107,8 +113,8 @@ class OzonSellerTreeClient:
     def resolve_by_sku(self, sku: str | int) -> ResolvedCategory:
         if not self.is_configured():
             raise OzonSellerTreeError(
-                "未配置 OZON_SELLER_COOKIE 或 OZON_SELLER_CLIENT_ID，"
-                "无法调用 seller-tree/resolve/by-sku"
+                "未配置 OZON_COOKIE（或 OZON_SELLER_CLIENT_ID），"
+                "无法自动解析 type_id / description_category_id"
             )
 
         sku_text = str(sku).strip()
@@ -131,8 +137,8 @@ class OzonSellerTreeClient:
                 "Chrome/152.0.0.0 Safari/537.36"
             ),
         }
-        # 后台实际请求体约 {"sku": <number>}
-        body = {"sku": int(sku_text)}
+        # 官方请求体：ResolveBySKURequest.Skus（必须 1~1000 个）
+        body = {"skus": [int(sku_text)]}
 
         try:
             response = requests.post(

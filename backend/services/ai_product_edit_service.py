@@ -178,16 +178,17 @@ def _apply_pricing_and_images(
     pricing_result: dict[str, Any] | None = None
     try:
         pricing_result = suggest_price_for_family(raw_product_family_id)
-        price_rub = pricing_result["pricing"]["price_rub"]
+        list_price = pricing_result["pricing"]["list_price"]
         stock_qty = pricing_result["pricing"]["stock_qty"]
         for variant in suggestion.get("variants") or []:
-            variant["price"] = price_rub
+            variant["price"] = list_price
             variant["quantity"] = stock_qty
         note = pricing_result.get("listing_notes") or ""
         old = suggestion.get("listing_notes") or ""
         suggestion["listing_notes"] = f"{note}\n{old}".strip()
         suggestion.setdefault("attributes", {})
         suggestion["attributes"]["pricing_formula"] = pricing_result["pricing"]["formula"]
+        suggestion["attributes"]["currency_code"] = pricing_result["pricing"]["currency_code"]
         suggestion["attributes"]["freight_channel"] = pricing_result["freight"]["channel_name"]
         suggestion["attributes"]["freight_cny"] = str(pricing_result["freight"]["freight_cny"])
     except Exception as exc:

@@ -101,7 +101,11 @@ def calc_suggested_price_rub(
     # 理解 A：扣完 20% 佣金后，相对成本再赚 30%
     price_cny = cost_cny * markup / (1.0 - commission)
     price_rub = price_cny * fx
+    price_cny_int = max(1, int(round(price_cny)))
     price_rub_int = max(1, int(round(price_rub)))
+    currency_code = (os.getenv("OZON_CURRENCY_CODE") or "CNY").strip().upper() or "CNY"
+    list_price = price_cny_int if currency_code == "CNY" else price_rub_int
+    unit = "¥" if currency_code == "CNY" else "₽"
 
     return {
         "supplier_price_cny": round(supplier_price_cny, 2),
@@ -111,10 +115,17 @@ def calc_suggested_price_rub(
         "profit_markup": markup,
         "rub_per_cny": fx,
         "price_cny": round(price_cny, 2),
+        "price_cny_int": price_cny_int,
         "price_rub": price_rub_int,
+        "currency_code": currency_code,
+        "list_price": list_price,
         "formula": (
             f"(({supplier_price_cny}+{freight_cny})×{markup}/(1-{commission}))"
-            f"×{fx} ≈ {price_rub_int} ₽"
+            + (
+                f" ≈ {list_price} {unit}"
+                if currency_code == "CNY"
+                else f"×{fx} ≈ {list_price} {unit}"
+            )
         ),
         "stock_qty": _env_int("OZON_DEFAULT_STOCK_QTY", DEFAULT_STOCK_QTY),
     }
@@ -175,8 +186,14 @@ def suggest_price_for_family(raw_product_family_id: int) -> dict[str, Any]:
         "pricing": pricing,
         "listing_notes": (
             f"定价理解A：((货本{pricing['supplier_price_cny']}+运费{pricing['freight_cny']})"
-            f"×{pricing['profit_markup']})/(1-{pricing['commission_rate']})×汇率{pricing['rub_per_cny']}"
-            f" → {pricing['price_rub']}₽；渠道 {freight_info['channel_name']}；库存默认 {pricing['stock_qty']}"
+            f"×{pricing['profit_markup']})/(1-{pricing['commission_rate']})"
+            + (
+                ""
+                if pricing["currency_code"] == "CNY"
+                else f"×汇率{pricing['rub_per_cny']}"
+            )
+            + f" → {pricing['list_price']} {pricing['currency_code']}；"
+            f"渠道 {freight_info['channel_name']}；库存默认 {pricing['stock_qty']}"
             + ("；重量为默认估算，请核对" if weight_assumed else "")
         ),
     }

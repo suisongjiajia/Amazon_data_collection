@@ -26,8 +26,8 @@ COMPOSER_API_BASES = (
 )
 
 ANTIBOT_HINT = (
-    "Ozon 反爬拦截。请用 Edge 打开 ozon.ru，在开发者工具 → 网络 中复制 Cookie，"
-    "填入 .env 的 OZON_COOKIE 后重启后端。"
+    "Ozon 反爬拦截。请用浏览器打开 ozon.ru 或 seller.ozon.ru，在开发者工具 → 网络 中复制 Cookie，"
+    "填入 .env 的 OZON_COOKIE 后重启后端（只需一套 Cookie）。"
 )
 
 

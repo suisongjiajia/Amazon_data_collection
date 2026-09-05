@@ -28,6 +28,14 @@ MIGRATION_STATEMENTS: list[tuple[str, str, str]] = [
         ADD COLUMN listing_built_at DATETIME NULL COMMENT 'Listing 生成时间' AFTER listing_payload
         """,
     ),
+    (
+        "ozon_publish_task",
+        "ozon_import_task_id",
+        """
+        ALTER TABLE ozon_publish_task
+        ADD COLUMN ozon_import_task_id BIGINT NULL COMMENT 'Ozon product/import 异步任务 ID' AFTER fail_count
+        """,
+    ),
 ]
 
 

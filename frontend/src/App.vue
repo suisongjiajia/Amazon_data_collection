@@ -23,6 +23,7 @@ onMounted(() => {
     :stats="store.stats.value"
     :notice="store.notice.value"
     :error="store.error.value"
+    :health="store.health.value"
     @update:module="store.setModule"
     @refresh="store.refreshAll"
   >
