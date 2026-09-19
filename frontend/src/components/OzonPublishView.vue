@@ -23,6 +23,19 @@ const selectedTaskId = ref<number | null>(null);
 const taskDetail = ref<OzonPublishTask | null>(null);
 const selectedEditId = ref<number | null>(null);
 const refreshing = ref(false);
+const publishingEditId = ref<number | null>(null);
+const reopeningEditId = ref<number | null>(null);
+const healingEditId = ref<number | null>(null);
+const republishingEditId = ref<number | null>(null);
+
+const isPublishingBusy = computed(
+  () =>
+    publishingEditId.value != null ||
+    reopeningEditId.value != null ||
+    healingEditId.value != null ||
+    republishingEditId.value != null ||
+    refreshing.value,
+);
 
 const approvedEdits = computed(() =>
   store.state.value.edits.filter((item) => item.status === "approved"),
@@ -78,13 +91,13 @@ function canRefresh(task: OzonPublishTask): boolean {
 
 function resultLabel(task: OzonPublishTask): string {
   if (task.status === "awaiting_pull" || task.status === "submitted" || task.status === "running") {
-    return `待拉取 ${task.total_count}`;
+    return `待拉取 · ${task.total_count} SKU`;
   }
   if (task.status === "pushed" || task.status === "partial") {
-    return `已推送（待可售） ${task.total_count}`;
+    return `已推送（待可售）· ${task.total_count} SKU`;
   }
   if (task.status === "listed" || task.status === "completed") {
-    return `上架成功 ${task.success_count}/${task.total_count}`;
+    return `上架成功 ${task.success_count}/${task.total_count} SKU`;
   }
   if (task.status === "failed") {
     return `推送失败 ${task.fail_count}/${task.total_count}`;
@@ -93,6 +106,9 @@ function resultLabel(task: OzonPublishTask): string {
 }
 
 async function publish(editId: number): Promise<void> {
+  if (publishingEditId.value != null) return;
+  publishingEditId.value = editId;
+  store.showNotice(simulatePublish.value ? "正在模拟推送…" : "正在推送到 Ozon…");
   try {
     const task = await apiRequest<OzonPublishTask>("/api/ozon/publish-tasks", {
       method: "POST",
@@ -100,18 +116,21 @@ async function publish(editId: number): Promise<void> {
         edit_id: editId,
         shop_name: shopName.value,
         simulate: simulatePublish.value,
+        auto_follow: !simulatePublish.value,
       }),
     });
     store.showNotice(
       simulatePublish.value
         ? "模拟任务已推送，状态为「待拉取」，请点击「拉取上架状态」"
-        : "已推送到 Ozon（待拉取）。请点击「拉取上架状态」确认是否可售，并自动生成条码",
+        : "已推送到 Ozon。系统将自动拉取状态；若不可售会补库存/修复并重推，直到可售",
     );
     await store.refreshAll();
     await openTask(task.id);
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
     await store.refreshAll();
+  } finally {
+    publishingEditId.value = null;
   }
 }
 
@@ -126,8 +145,9 @@ async function openTask(taskId: number): Promise<void> {
 }
 
 async function refreshStatus(): Promise<void> {
-  if (selectedTaskId.value == null) return;
+  if (selectedTaskId.value == null || refreshing.value) return;
   refreshing.value = true;
+  store.showNotice("正在拉取上架状态…");
   try {
     const task = await apiRequest<OzonPublishTask>(
       `/api/ozon/publish-tasks/${selectedTaskId.value}/refresh-status`,
@@ -159,6 +179,9 @@ function selectApproved(edit: ProductEdit): void {
 }
 
 async function reopenEdit(editId: number): Promise<void> {
+  if (reopeningEditId.value != null) return;
+  reopeningEditId.value = editId;
+  store.showNotice("正在重新打开编辑…");
   try {
     await apiRequest<ProductEdit>(`/api/ozon/publish-tasks/reopen-edit/${editId}`, {
       method: "POST",
@@ -168,6 +191,54 @@ async function reopenEdit(editId: number): Promise<void> {
     await store.refreshAll();
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    reopeningEditId.value = null;
+  }
+}
+
+async function aiHealAndRepublish(editId: number): Promise<void> {
+  if (healingEditId.value != null) return;
+  healingEditId.value = editId;
+  store.showNotice("AI 正在按报错修复尺寸/属性并重推，请稍候…");
+  try {
+    const result = await apiRequest<{ message?: string; publish_task?: OzonPublishTask }>(
+      `/api/ozon/publish-tasks/ai-heal/${editId}`,
+      { method: "POST" },
+    );
+    store.showNotice(result.message || "AI 修复完成并已重新推送");
+    if (result.publish_task?.id) {
+      selectedTaskId.value = result.publish_task.id;
+      taskDetail.value = result.publish_task;
+    }
+    await store.refreshAll();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+    await store.refreshAll();
+  } finally {
+    healingEditId.value = null;
+  }
+}
+
+async function republishListed(editId: number): Promise<void> {
+  if (republishingEditId.value != null) return;
+  republishingEditId.value = editId;
+  store.showNotice("正在重新生成 Listing（含完整图库）并推送更新…");
+  try {
+    const result = await apiRequest<{ message?: string; publish_task?: OzonPublishTask }>(
+      `/api/ozon/publish-tasks/republish/${editId}`,
+      { method: "POST" },
+    );
+    store.showNotice(result.message || "已重新推送更新，后台将自动拉取状态");
+    if (result.publish_task?.id) {
+      selectedTaskId.value = result.publish_task.id;
+      taskDetail.value = result.publish_task;
+    }
+    await store.refreshAll();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+    await store.refreshAll();
+  } finally {
+    republishingEditId.value = null;
   }
 }
 
@@ -243,7 +314,8 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
       message: `${item.seller_sku}: ${detail}`,
     });
   }
-  if (!first.description_category_id || !first.type_id) {
+  const hasSubmission = Boolean(first.description_category_id || first.type_id || first.name || first.price);
+  if (hasSubmission && (!first.description_category_id || !first.type_id)) {
     issues.push({
       code: "MISSING_CATEGORY_TYPE",
       severity: "error" as const,
@@ -252,7 +324,9 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
   }
 
   return {
-    ok: Boolean(first.description_category_id && first.type_id) && !task.error_message,
+    ok: hasSubmission
+      ? Boolean(first.description_category_id && first.type_id) && !task.error_message
+      : !task.error_message,
     issues,
     summary,
     payload_items: payloads,
@@ -319,10 +393,21 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
                 <td><ErpBadge :status="edit.status" /></td>
                 <td @click.stop>
                   <div class="erp-table-actions">
-                    <ErpButton size="sm" :disabled="store.loading.value" @click="publish(edit.id)">
-                      推送到 Ozon
+                    <ErpButton
+                      size="sm"
+                      :disabled="isPublishingBusy || store.loading.value"
+                      @click="publish(edit.id)"
+                    >
+                      {{ publishingEditId === edit.id ? "推送中…" : "推送到 Ozon" }}
                     </ErpButton>
-                    <ErpButton size="sm" variant="ghost" @click="reopenEdit(edit.id)">回编辑</ErpButton>
+                    <ErpButton
+                      size="sm"
+                      variant="ghost"
+                      :disabled="isPublishingBusy"
+                      @click="reopenEdit(edit.id)"
+                    >
+                      {{ reopeningEditId === edit.id ? "打开中…" : "回编辑" }}
+                    </ErpButton>
                   </div>
                 </td>
               </tr>
@@ -468,24 +553,39 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
           <div class="erp-editor-actions" style="margin-top: 12px">
             <ErpButton
               v-if="canRefresh(taskDetail)"
-              :disabled="refreshing"
+              :disabled="isPublishingBusy"
               @click="refreshStatus"
             >
               {{ refreshing ? "拉取中…" : "拉取上架状态" }}
             </ErpButton>
             <ErpButton
-              v-if="taskDetail.status === 'failed' || taskDetail.status === 'pushed' || taskDetail.status === 'partial' || taskDetail.edit_status === 'approved'"
-              variant="secondary"
-              @click="publish(taskDetail.edit_id)"
+              v-if="taskDetail.status === 'listed' || taskDetail.status === 'completed' || taskDetail.edit_status === 'published' || taskDetail.status === 'running' || taskDetail.status === 'awaiting_pull' || taskDetail.status === 'pushed' || taskDetail.status === 'partial'"
+              :disabled="isPublishingBusy"
+              @click="republishListed(taskDetail.edit_id)"
             >
-              再次推送
+              {{ republishingEditId === taskDetail.edit_id ? "更新推送中…" : "更新上架内容" }}
             </ErpButton>
             <ErpButton
-              v-if="taskDetail.edit_status !== 'published'"
+              v-if="taskDetail.status === 'failed' || taskDetail.status === 'pushed' || taskDetail.status === 'partial' || taskDetail.edit_status === 'approved'"
+              variant="secondary"
+              :disabled="isPublishingBusy"
+              @click="publish(taskDetail.edit_id)"
+            >
+              {{ publishingEditId === taskDetail.edit_id ? "推送中…" : "再次推送" }}
+            </ErpButton>
+            <ErpButton
+              v-if="taskDetail.status === 'failed' || taskDetail.status === 'pushed' || taskDetail.status === 'partial'"
+              :disabled="isPublishingBusy"
+              @click="aiHealAndRepublish(taskDetail.edit_id)"
+            >
+              {{ healingEditId === taskDetail.edit_id ? "AI 修复中…" : "AI 修复并重推" }}
+            </ErpButton>
+            <ErpButton
               variant="ghost"
+              :disabled="isPublishingBusy"
               @click="reopenEdit(taskDetail.edit_id)"
             >
-              回编辑修复
+              {{ reopeningEditId === taskDetail.edit_id ? "打开中…" : "回编辑修复" }}
             </ErpButton>
           </div>
 

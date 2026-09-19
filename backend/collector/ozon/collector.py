@@ -11,6 +11,10 @@ except ImportError:
     import requests as http_requests  # type: ignore[no-redef]
     HAS_CURL_CFFI = False
 
+from collector.ozon.browser_session import (
+    get_ozon_browser_session,
+    ozon_browser_enabled,
+)
 from collector.ozon.models import OzonCollectConfig, OzonCollectionStrategy, OzonProductInfo
 from collector.ozon.parser import (
     extract_composer_from_html,
@@ -26,8 +30,8 @@ COMPOSER_API_BASES = (
 )
 
 ANTIBOT_HINT = (
-    "Ozon 反爬拦截。请用浏览器打开 ozon.ru 或 seller.ozon.ru，在开发者工具 → 网络 中复制 Cookie，"
-    "填入 .env 的 OZON_COOKIE 后重启后端（只需一套 Cookie）。"
+    "Ozon 反爬拦截。请先运行 start-ozon-chrome.ps1，"
+    "在弹出的 Chrome 中打开 ozon.ru 完成验证并保持窗口开着，再重试采集。"
 )
 
 
@@ -55,15 +59,16 @@ class OzonCollector:
         self.config = config or OzonCollectConfig.defaults()
         self.url_parser = OzonUrlParser()
         self.session = self._build_session()
+        self._use_browser = ozon_browser_enabled()
         if self.config.cookie:
             apply_cookie_string(self.session, self.config.cookie)
 
-    def collect(self, url: str) -> list[OzonProductInfo]:
+    def collect(self, url: str, max_products: int | None = None) -> list[OzonProductInfo]:
         parsed = self.url_parser.parse(url)
         self._prepare_session(parsed)
         if parsed.type is OzonUrlType.PRODUCT:
             return [self._collect_product(parsed)]
-        return self._collect_from_listing(parsed)
+        return self._collect_from_listing(parsed, max_products=max_products)
 
     def collect_with_strategy(self, strategy_type: str, strategy_params: dict[str, Any]) -> list[OzonProductInfo]:
         strategy = OzonCollectionStrategy(strategy_type)
@@ -119,6 +124,14 @@ class OzonCollector:
         return session
 
     def _prepare_session(self, parsed: OzonParseResult | None = None) -> None:
+        if self._use_browser:
+            try:
+                get_ozon_browser_session().ensure_started()
+                return
+            except Exception:
+                # 浏览器不可用时回退 HTTP 预热
+                pass
+
         warmup_urls = ["https://www.ozon.ru/"]
         if parsed is not None:
             warmup_urls.append(f"https://www.ozon.ru{parsed.page_path}")
@@ -260,7 +273,13 @@ class OzonCollector:
     def _fetch_page(self, page_path: str) -> dict[str, Any]:
         page_path = page_path if page_path.startswith("/") else f"/{page_path}"
         referer = f"https://www.ozon.ru{page_path.split('?')[0]}"
-        composer_page = self._fetch_composer(page_path, referer=referer)
+
+        if self._use_browser:
+            browser_page = self._fetch_via_browser(page_path)
+            if browser_page.get("widgetStates"):
+                return browser_page
+
+        composer_page = self._fetch_composer_http(page_path, referer=referer)
         if composer_page.get("widgetStates"):
             return composer_page
 
@@ -268,11 +287,38 @@ class OzonCollector:
         if html_page is not None:
             return html_page
 
+        if self._use_browser and composer_page:
+            return composer_page
         if composer_page:
             return composer_page
         raise RuntimeError(ANTIBOT_HINT)
 
-    def _fetch_composer(self, page_path: str, referer: str) -> dict[str, Any]:
+    def _fetch_via_browser(self, page_path: str) -> dict[str, Any]:
+        browser = get_ozon_browser_session()
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                payload = browser.fetch_composer(page_path, timeout_seconds=self.config.timeout_seconds)
+                if isinstance(payload, dict) and payload.get("widgetStates"):
+                    return payload
+                last_error = RuntimeError("浏览器返回无 widgetStates")
+            except Exception as exc:
+                last_error = exc
+            if attempt == 0:
+                browser.reset()
+        if last_error:
+            # 再试 HTML 渲染解析
+            try:
+                html = browser.fetch_html(page_path, timeout_seconds=self.config.timeout_seconds)
+                payload = extract_composer_from_html(html)
+                if payload and payload.get("widgetStates"):
+                    return payload
+            except Exception:
+                pass
+            raise RuntimeError(f"{ANTIBOT_HINT} ({last_error})")
+        return {}
+
+    def _fetch_composer_http(self, page_path: str, referer: str) -> dict[str, Any]:
         page_path = page_path if page_path.startswith("/") else f"/{page_path}"
         encoded = quote(page_path, safe="/?=&%")
         headers = {
@@ -301,7 +347,7 @@ class OzonCollector:
                 last_error = exc
                 continue
 
-        if last_error:
+        if last_error and not self._use_browser:
             raise RuntimeError(f"无法获取 Ozon 页面数据: {last_error}")
         return {}
 

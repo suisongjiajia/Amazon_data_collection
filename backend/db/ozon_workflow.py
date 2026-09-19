@@ -189,6 +189,10 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
         attributes.setdefault("weight", details["weight"])
     attributes.setdefault("brand_mode", "no_brand")
     attributes.setdefault("fulfillment", "rFBS")
+    # 全站统一包裹：100×100×100 mm / 200g
+    from services.ozon_listing_payload import apply_fixed_package_attributes
+
+    attributes = apply_fixed_package_attributes(attributes)
 
     initial_qty = DEFAULT_STOCK_QTY
     initial_price = None
@@ -243,6 +247,7 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
             )
             edit_id = int(cursor.fetchone()[0])
 
+            kept_skus: list[str] = []
             for variant in family.get("variants") or []:
                 sku = f"OZON-{variant.get('external_id') or variant['id']}"
                 cursor.execute(
@@ -261,6 +266,9 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                         title = COALESCE(VALUES(title), title),
                         price = COALESCE(VALUES(price), price),
                         quantity = VALUES(quantity),
+                        image_url = COALESCE(VALUES(image_url), image_url),
+                        variant_attributes = COALESCE(VALUES(variant_attributes), variant_attributes),
+                        raw_product_variant_id = VALUES(raw_product_variant_id),
                         updated_at = CURRENT_TIMESTAMP
                     """,
                     (
@@ -273,6 +281,22 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                         variant.get("main_image_url"),
                         to_json(variant.get("variant_attributes") or {}),
                     ),
+                )
+                kept_skus.append(sku)
+
+            if kept_skus:
+                placeholders = ", ".join(["%s"] * len(kept_skus))
+                cursor.execute(
+                    f"""
+                    DELETE FROM product_edit_variant
+                    WHERE edit_id = %s AND sku NOT IN ({placeholders})
+                    """,
+                    (edit_id, *kept_skus),
+                )
+            else:
+                cursor.execute(
+                    "DELETE FROM product_edit_variant WHERE edit_id = %s",
+                    (edit_id,),
                 )
 
     return get_product_edit(edit_id)
@@ -454,14 +478,21 @@ def submit_product_edit_for_review(edit_id: int) -> dict[str, Any]:
 
 def reopen_product_edit(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
-    if edit["status"] not in ("listing_ready", "pending_review", "approved", "rejected"):
+    if edit["status"] not in (
+        "listing_ready",
+        "pending_review",
+        "needs_fix",
+        "approved",
+        "rejected",
+        "published",
+    ):
         raise ValueError("当前状态不可重新打开编辑")
     return update_product_edit(edit_id, status="editing", clear_listing=True)
 
 
 def delete_product_edit(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
-    if edit["status"] not in ("draft", "editing", "rejected", "listing_ready"):
+    if edit["status"] not in ("draft", "editing", "rejected", "listing_ready", "needs_fix"):
         raise ValueError("待审核、已通过或已发布的编辑不能取消")
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -525,6 +556,21 @@ def create_ozon_publish_task(edit_id: int, *, shop_name: str | None = None) -> d
     task_no = build_code("OZPUB")
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            # 同一编辑只保留一条进行中任务：旧任务标为 superseded，避免列表重复
+            cursor.execute(
+                """
+                UPDATE ozon_publish_task
+                SET status = 'superseded',
+                    error_message = COALESCE(
+                        NULLIF(error_message, ''),
+                        '已被新的发布任务替代'
+                    ),
+                    finished_at = COALESCE(finished_at, %s)
+                WHERE edit_id = %s
+                  AND status NOT IN ('listed', 'completed', 'superseded')
+                """,
+                (datetime.now(), edit_id),
+            )
             cursor.execute(
                 """
                 INSERT INTO ozon_publish_task (
@@ -576,20 +622,28 @@ def get_ozon_publish_task(task_id: int) -> dict[str, Any]:
 
 
 def list_ozon_publish_tasks(limit: int = 50) -> list[dict[str, Any]]:
+    """每个 edit_id 只返回最新一条任务，避免同商品多行刷屏。"""
     tasks = fetch_all(
         """
-        SELECT opt.*, pe.title AS edit_title, pe.status AS edit_status, pe.images AS edit_images,
+        SELECT t.*, pe.title AS edit_title, pe.status AS edit_status, pe.images AS edit_images,
                rf.main_image_url AS main_image_url, rf.title AS family_title,
                rf.external_id AS family_external_id
-        FROM ozon_publish_task opt
-        JOIN product_edit pe ON pe.id = opt.edit_id
+        FROM (
+            SELECT opt.*,
+                   ROW_NUMBER() OVER (PARTITION BY opt.edit_id ORDER BY opt.created_at DESC, opt.id DESC) AS rn
+            FROM ozon_publish_task opt
+            WHERE opt.status <> 'superseded'
+        ) t
+        JOIN product_edit pe ON pe.id = t.edit_id
         JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
-        ORDER BY opt.created_at DESC
+        WHERE t.rn = 1
+        ORDER BY t.created_at DESC
         LIMIT %s
         """,
         (limit,),
     )
     for task in tasks:
+        task.pop("rn", None)
         task["items"] = fetch_all(
             "SELECT * FROM ozon_publish_item WHERE task_id = %s ORDER BY id",
             (task["id"],),

@@ -1,6 +1,5 @@
+from fastapi import APIRouter, File, Form, UploadFile
 from typing import Any
-
-from fastapi import APIRouter
 
 from api_errors import handle_api_errors
 import database
@@ -20,14 +19,17 @@ from schemas import (
     ProductEditVariantUpdateRequest,
     PublishTaskCreateRequest,
     ReviewDecisionRequest,
+    ReviewPriceUpdateRequest,
     SelectionCreateRequest,
     SelectionVariantScopeUpdateRequest,
+    ShopPipelineStartRequest,
+    ShopPipelineFromCollectionRequest,
     SourcingSearchRequest,
 )
 from services import catalog_service, collection_service, draft_service, publish_service
 from services import ozon_collection_service, ozon_publish_service, product_edit_service, review_service, sourcing_service
-from services import ai_product_edit_service, ozon_pricing_service
-from integrations.aliyun_oss import rehost_image_urls
+from services import ai_product_edit_service, ozon_pricing_service, publish_auto_service, shop_pipeline_service
+from integrations.aliyun_oss import rehost_image_urls, upload_local_images
 from integrations.aliyun_oss.client import OssError
 from db.ozon_catalog import get_ozon_product_family
 from services.sourcing_service import _enrich_ozon_family_for_display
@@ -232,7 +234,77 @@ def list_listing_live(limit: int = 100) -> list[dict[str, Any]]:
 @router.post("/ozon/collect")
 def collect_ozon_url(request: OzonCollectUrlRequest) -> dict[str, Any]:
     return handle_api_errors(
-        lambda: ozon_collection_service.run_ozon_url_collection(request.url),
+        lambda: ozon_collection_service.run_ozon_url_collection(
+            request.url,
+            max_products=request.max_products,
+        ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/ozon/shop-popular")
+def collect_ozon_shop_popular(request: ShopPipelineStartRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: ozon_collection_service.run_ozon_shop_popular_collection(
+            request.shop_url,
+            top_n=request.top_n,
+        ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/shop-pipeline/start")
+def start_shop_pipeline(request: ShopPipelineStartRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: shop_pipeline_service.start_shop_pipeline(
+            request.shop_url,
+            top_n=request.top_n,
+        ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/shop-pipeline/from-collection")
+def start_shop_pipeline_from_collection(request: ShopPipelineFromCollectionRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: shop_pipeline_service.start_pipeline_from_collection_task(
+            request.collection_task_id,
+            limit=request.limit,
+        ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.get("/shop-pipeline/jobs")
+def list_shop_pipeline_jobs(limit: int = 50) -> list[dict[str, Any]]:
+    return shop_pipeline_service.list_jobs(limit)
+
+
+@router.get("/shop-pipeline/jobs/{job_id}")
+def get_shop_pipeline_job(job_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: shop_pipeline_service.get_job(job_id),
+        value_error_status=404,
+    )
+
+
+@router.post("/shop-pipeline/jobs/{job_id}/retry-failed")
+def retry_shop_pipeline_failed(job_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: shop_pipeline_service.retry_failed_items(job_id),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/shop-pipeline/items/{item_id}/retry")
+def retry_shop_pipeline_item(item_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: shop_pipeline_service.retry_item(item_id),
         value_error_status=400,
         runtime_error_status=502,
     )
@@ -370,6 +442,37 @@ def rehost_product_images(request: RehostImagesRequest) -> dict[str, Any]:
     return handle_api_errors(_action, value_error_status=400, runtime_error_status=502)
 
 
+@router.post("/product-edits/upload-images")
+async def upload_product_images(
+    files: list[UploadFile] = File(...),
+    sku: str = Form("item"),
+) -> dict[str, Any]:
+    from fastapi import HTTPException
+
+    if not files:
+        raise HTTPException(status_code=400, detail="请选择要上传的图片")
+    if len(files) > 15:
+        raise HTTPException(status_code=400, detail="单次最多上传 15 张图片")
+
+    payload: list[tuple[str, bytes, str]] = []
+    for item in files:
+        data = await item.read()
+        payload.append(
+            (
+                item.filename or "image.jpg",
+                data,
+                item.content_type or "image/jpeg",
+            )
+        )
+
+    try:
+        return upload_local_images(payload, sku=sku or "item")
+    except OssError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/product-edits")
 def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
     return handle_api_errors(
@@ -486,12 +589,34 @@ def get_review_listing(edit_id: int) -> dict[str, Any]:
     )
 
 
-@router.post("/reviews/{edit_id}/approve")
-def approve_review(edit_id: int, request: ReviewDecisionRequest) -> dict[str, Any]:
+@router.patch("/reviews/{edit_id}/prices")
+def update_review_prices(edit_id: int, request: ReviewPriceUpdateRequest) -> dict[str, Any]:
     return handle_api_errors(
-        lambda: review_service.approve(edit_id, note=request.note, reviewer=request.reviewer),
+        lambda: review_service.update_prices(
+            edit_id,
+            apply_all_price=request.apply_all_price,
+            variant_prices=(
+                [item.model_dump() for item in request.variant_prices]
+                if request.variant_prices
+                else None
+            ),
+        ),
         value_error_status=400,
     )
+
+
+@router.post("/reviews/{edit_id}/approve")
+def approve_review(edit_id: int, request: ReviewDecisionRequest) -> dict[str, Any]:
+    def _action() -> dict[str, Any]:
+        if request.auto_publish:
+            return publish_auto_service.approve_and_auto_publish(
+                edit_id,
+                note=request.note,
+                reviewer=request.reviewer,
+            )
+        return review_service.approve(edit_id, note=request.note, reviewer=request.reviewer)
+
+    return handle_api_errors(_action, value_error_status=400, runtime_error_status=502)
 
 
 @router.post("/reviews/{edit_id}/reject")
@@ -509,6 +634,7 @@ def create_ozon_publish_task(request: OzonPublishRequest) -> dict[str, Any]:
             request.edit_id,
             shop_name=request.shop_name,
             simulate=request.simulate,
+            auto_follow=request.auto_follow and not request.simulate,
         ),
         value_error_status=400,
         runtime_error_status=502,
@@ -530,8 +656,18 @@ def get_ozon_publish_task(task_id: int) -> dict[str, Any]:
 
 @router.post("/ozon/publish-tasks/{task_id}/refresh-status")
 def refresh_ozon_publish_task_status(task_id: int) -> dict[str, Any]:
+    def _run() -> dict[str, Any]:
+        task = ozon_publish_service.refresh_import_status(task_id)
+        status = str(task.get("status") or "")
+        # 手动拉取后若仍未可售，自动挂上后台跟进闭环
+        if status in {"awaiting_pull", "pushed", "partial", "submitted", "running"}:
+            edit_id = int(task.get("edit_id") or 0)
+            if edit_id:
+                publish_auto_service.start_publish_follow(int(task["id"]), edit_id)
+        return task
+
     return handle_api_errors(
-        lambda: ozon_publish_service.refresh_import_status(task_id),
+        _run,
         value_error_status=400,
         runtime_error_status=502,
     )
@@ -542,4 +678,24 @@ def reopen_edit_from_publish(edit_id: int) -> dict[str, Any]:
     return handle_api_errors(
         lambda: ozon_publish_service.reopen_edit_from_publish(edit_id),
         value_error_status=400,
+    )
+
+
+@router.post("/ozon/publish-tasks/republish/{edit_id}")
+def republish_listed_edit(edit_id: int) -> dict[str, Any]:
+    """已上架成功：重新生成 Listing（修图库等）并推送更新。"""
+    return handle_api_errors(
+        lambda: ozon_publish_service.republish_listed_edit(edit_id, auto_follow=True),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/ozon/publish-tasks/ai-heal/{edit_id}")
+def ai_heal_and_republish(edit_id: int) -> dict[str, Any]:
+    """发布失败后：规则修复 + AI 修复尺寸/字典属性，并自动重推。"""
+    return handle_api_errors(
+        lambda: publish_auto_service.heal_and_republish(edit_id, auto_follow=True),
+        value_error_status=400,
+        runtime_error_status=502,
     )

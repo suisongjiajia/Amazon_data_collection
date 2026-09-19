@@ -167,3 +167,47 @@ def rehost_image_urls(
         raise OssError("没有成功转存任何图片：" + (errors[0]["error"] if errors else "空列表"))
 
     return {"images": uploaded, "errors": errors, "count": len(uploaded)}
+
+
+def upload_local_images(
+    files: list[tuple[str, bytes, str]],
+    *,
+    sku: str = "item",
+) -> dict[str, Any]:
+    """
+    上传本地图片字节到 OSS。
+    files: [(filename, data, content_type), ...]
+    """
+    client = AliyunOssClient()
+    client.ensure_configured()
+    sku_part = _safe_sku_segment(sku)
+    uploaded: list[str] = []
+    errors: list[dict[str, str]] = []
+
+    for index, (filename, data, content_type) in enumerate(files):
+        name = str(filename or f"image-{index + 1}.jpg")
+        raw_type = (content_type or "").split(";")[0].strip().lower() or "image/jpeg"
+        if not data:
+            errors.append({"file": name, "error": "空文件"})
+            continue
+        if raw_type and not raw_type.startswith("image/"):
+            lower = name.lower()
+            if not lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                errors.append({"file": name, "error": f"不支持的类型: {raw_type or 'unknown'}"})
+                continue
+            raw_type = "image/jpeg"
+        if len(data) > 12 * 1024 * 1024:
+            errors.append({"file": name, "error": "单张图片不能超过 12MB"})
+            continue
+        try:
+            ext = _guess_extension(name, raw_type)
+            key = f"products/{sku_part}/local-{index + 1}-{uuid.uuid4().hex[:10]}{ext}"
+            public_url = client.upload_bytes(key=key, data=data, content_type=raw_type)
+            uploaded.append(public_url)
+        except Exception as exc:
+            errors.append({"file": name, "error": str(exc)})
+
+    if not uploaded:
+        raise OssError("没有成功上传任何图片：" + (errors[0]["error"] if errors else "空列表"))
+
+    return {"images": uploaded, "errors": errors, "count": len(uploaded)}

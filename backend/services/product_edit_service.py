@@ -27,6 +27,42 @@ def create_edit(raw_product_family_id: int) -> dict[str, Any]:
         return update_product_edit(int(edit["id"]), attributes=attributes)
 
 
+def apply_ai_suggestion_to_edit(edit_id: int, suggestion: dict[str, Any]) -> dict[str, Any]:
+    """将 AI 生成结果写入编辑草稿（标题/描述/卖点/图片/属性/变体价格库存）。"""
+    edit = get_product_edit(edit_id)
+    current_attrs = dict(edit.get("attributes") or {})
+    incoming_attrs = dict(suggestion.get("attributes") or {})
+    merged = {**current_attrs, **incoming_attrs}
+    for key in ("description_category_id", "type_id"):
+        if current_attrs.get(key):
+            merged[key] = current_attrs[key]
+    if suggestion.get("listing_notes"):
+        merged["listing_notes"] = str(suggestion["listing_notes"])
+
+    update_product_edit(
+        edit_id,
+        title=str(suggestion.get("title") or edit.get("title") or "").strip() or edit.get("title"),
+        description=str(suggestion.get("description") or edit.get("description") or ""),
+        bullet_points=list(suggestion.get("bullet_points") or edit.get("bullet_points") or []),
+        images=list(suggestion.get("images") or edit.get("images") or []),
+        attributes=merged,
+        status="editing",
+        clear_listing=True,
+    )
+
+    variants = list(edit.get("variants") or [])
+    sug_variants = list(suggestion.get("variants") or [])
+    for index, variant in enumerate(variants):
+        sug = sug_variants[index] if index < len(sug_variants) else {}
+        update_product_edit_variant(
+            int(variant["id"]),
+            title=str(sug.get("title") or variant.get("title") or suggestion.get("title") or ""),
+            price=float(sug["price"]) if sug.get("price") is not None else None,
+            quantity=int(sug["quantity"]) if sug.get("quantity") is not None else None,
+        )
+    return get_product_edit(edit_id)
+
+
 def get_edit(edit_id: int) -> dict[str, Any]:
     return get_product_edit(edit_id)
 
@@ -100,8 +136,16 @@ def build_listing(edit_id: int) -> dict[str, Any]:
     except Exception as exc:
         raise ValueError(
             f"自动获取 type_id / description_category_id 失败：{exc}。"
-            "请检查 .env 中 OZON_COOKIE、OZON_SELLER_CLIENT_ID 后重试"
+            "请运行 start-ozon-chrome.ps1，在调试 Chrome 登录 seller.ozon.ru 后重试"
+            "（并确认已配置 OZON_SELLER_CLIENT_ID）"
         ) from exc
+
+    # 生成 Listing 前统一写入 100×100×100mm / 200g
+    from services.ozon_listing_payload import apply_fixed_package_attributes, force_package_metrics_enabled
+
+    if force_package_metrics_enabled():
+        attrs = apply_fixed_package_attributes(edit.get("attributes") or {})
+        edit = update_product_edit(edit_id, attributes=attrs)
 
     preview = preview_listing(edit)
     if not preview["ok"]:

@@ -256,3 +256,23 @@ def list_ozon_product_families(limit: int = 100) -> list[dict[str, Any]]:
             (family["id"],),
         )
     return families
+
+
+def list_ozon_product_families_by_task(task_id: int, limit: int = 200) -> list[dict[str, Any]]:
+    families = fetch_all(
+        """
+        SELECT rf.*,
+               (SELECT COUNT(*) FROM raw_product_variant rv WHERE rv.family_id = rf.id) AS variant_count
+        FROM raw_product_family rf
+        WHERE rf.platform = 'ozon' AND rf.task_id = %s
+        ORDER BY rf.sales_rank IS NULL, rf.sales_rank, rf.id
+        LIMIT %s
+        """,
+        (task_id, limit),
+    )
+    for family in families:
+        family["variants"] = fetch_all(
+            "SELECT * FROM raw_product_variant WHERE family_id = %s ORDER BY id",
+            (family["id"],),
+        )
+    return families

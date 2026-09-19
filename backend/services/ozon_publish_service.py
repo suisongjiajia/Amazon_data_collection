@@ -31,7 +31,21 @@ from services.ozon_listing_payload import (
 )
 
 
-def publish_edit(edit_id: int, *, shop_name: str | None = None, simulate: bool = True) -> dict:
+def publish_edit(
+    edit_id: int,
+    *,
+    shop_name: str | None = None,
+    simulate: bool = True,
+    auto_follow: bool = False,
+) -> dict:
+    from services.ozon_listing_payload import apply_fixed_package_attributes, force_package_metrics_enabled
+    from db.ozon_workflow import update_product_edit
+
+    edit = get_product_edit(edit_id)
+    if force_package_metrics_enabled():
+        attrs = apply_fixed_package_attributes(edit.get("attributes") or {})
+        update_product_edit(edit_id, attributes=attrs)
+    _ensure_variant_stock_qty(edit_id, edit)
     edit = get_product_edit(edit_id)
     preview = preview_listing(edit)
     if not preview["ok"]:
@@ -45,7 +59,13 @@ def publish_edit(edit_id: int, *, shop_name: str | None = None, simulate: bool =
         _simulate_submit(int(task["id"]), preview)
     else:
         _submit_via_ozon_api(int(task["id"]))
-    return get_ozon_publish_task(int(task["id"]))
+
+    result = get_ozon_publish_task(int(task["id"]))
+    if auto_follow and not simulate:
+        from services.publish_auto_service import start_publish_follow
+
+        start_publish_follow(int(result["id"]), edit_id)
+    return result
 
 
 def list_tasks(limit: int = 50) -> list[dict]:
@@ -59,6 +79,93 @@ def get_task(task_id: int) -> dict[str, Any]:
 def reopen_edit_from_publish(edit_id: int) -> dict[str, Any]:
     """发布失败或审核通过后需修改内容时，重新打开编辑。"""
     return reopen_product_edit(edit_id)
+
+
+def republish_listed_edit(edit_id: int, *, auto_follow: bool = True) -> dict[str, Any]:
+    """
+    已上架成功的商品：重新生成 Listing（含完整图库/统一尺寸）并再次推送更新。
+    不走 reopen 清档，避免只更新图片时把 description_category_id / type_id 弄丢。
+    """
+    from db.ozon_workflow import update_product_edit
+    from services import product_edit_service
+    from services.ozon_category_resolve_service import ensure_edit_category_ids
+    from services.ozon_listing_payload import apply_fixed_package_attributes, force_package_metrics_enabled
+
+    edit = get_product_edit(edit_id)
+    status = str(edit.get("status") or "")
+    if status not in {"published", "approved", "listing_ready", "editing", "needs_fix"}:
+        raise ValueError(f"当前状态「{status}」不可更新上架，请先回编辑或审核")
+
+    attrs = dict(edit.get("attributes") or {})
+    # 从旧 Listing 快照 / 采集 family 回填类目，避免更新图片时类目变空
+    attrs = _restore_category_ids(edit, attrs)
+    if force_package_metrics_enabled():
+        attrs = apply_fixed_package_attributes(attrs)
+    update_product_edit(edit_id, attributes=attrs, status="editing")
+
+    try:
+        ensure_edit_category_ids(edit_id, force=False)
+    except Exception as exc:
+        # 已有类目则继续；完全没有才失败
+        edit = get_product_edit(edit_id)
+        attrs = dict(edit.get("attributes") or {})
+        if not str(attrs.get("description_category_id") or "").strip() or not str(attrs.get("type_id") or "").strip():
+            raise ValueError(
+                f"缺少 description_category_id / type_id，无法更新上架：{exc}"
+            ) from exc
+
+    built = product_edit_service.build_listing(edit_id)
+    if not built.get("ok") or not built.get("saved"):
+        messages = "; ".join(
+            issue.get("message") or ""
+            for issue in (built.get("issues") or [])
+            if issue.get("severity") == "error"
+        )
+        raise ValueError(f"重新生成 Listing 失败：{messages or built.get('build_error') or '未知'}")
+
+    update_product_edit(edit_id, status="approved")
+    task = publish_edit(edit_id, simulate=False, auto_follow=auto_follow)
+    return {
+        "ok": True,
+        "message": "已重新生成 Listing 并推送更新（含完整图库），后台将自动拉取状态",
+        "publish_task": task,
+    }
+
+
+def _restore_category_ids(edit: dict[str, Any], attrs: dict[str, Any]) -> dict[str, Any]:
+    """优先保留 attributes，其次旧 listing 快照，再次采集 family。"""
+    from db.ozon_catalog import get_ozon_product_family
+
+    category = str(attrs.get("description_category_id") or attrs.get("category_id") or "").strip()
+    type_id = str(attrs.get("type_id") or "").strip()
+
+    listing = edit.get("listing_payload") if isinstance(edit.get("listing_payload"), dict) else {}
+    summary = listing.get("summary") if isinstance(listing.get("summary"), dict) else {}
+    payload_items = listing.get("payload_items") if isinstance(listing.get("payload_items"), list) else []
+    first_item = payload_items[0] if payload_items and isinstance(payload_items[0], dict) else {}
+
+    if not category:
+        category = str(
+            summary.get("description_category_id")
+            or first_item.get("description_category_id")
+            or ""
+        ).strip()
+    if not type_id:
+        type_id = str(summary.get("type_id") or first_item.get("type_id") or "").strip()
+
+    if (not category or not type_id) and edit.get("raw_product_family_id"):
+        try:
+            family = get_ozon_product_family(int(edit["raw_product_family_id"]))
+            category = category or str(family.get("category_id") or "").strip()
+            type_id = type_id or str(family.get("type_id") or "").strip()
+        except Exception:
+            pass
+
+    if category:
+        attrs["description_category_id"] = category
+    if type_id:
+        attrs["type_id"] = type_id
+    return attrs
 
 
 def refresh_import_status(task_id: int) -> dict[str, Any]:
@@ -75,14 +182,22 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
     if import_task_id is None:
         import_task_id = _recover_import_task_id(items)
     if import_task_id is None:
-        raise ValueError("缺少 Ozon 导入任务 ID，请重新推送后再拉取状态")
+        import_task_id = _recover_import_task_id_from_edit(int(task["edit_id"]), task_id)
+
+    # 无导入任务 ID：按 offer_id 直接查 Ozon 已有商品（已上架成功再更新卡住时）
+    if import_task_id is None:
+        return _refresh_status_from_existing_offers(task_id)
 
     client = OzonSellerClient()
     try:
         info = client.get_import_info(int(import_task_id))
     except OzonSellerError as exc:
-        _mark_publish_failed(task_id, error_code="OZON_IMPORT_INFO_ERROR", error_message=str(exc))
-        raise
+        # import/info 失效时，仍尝试按 SKU 同步已存在商品
+        try:
+            return _refresh_status_from_existing_offers(task_id)
+        except Exception:
+            _mark_publish_failed(task_id, error_code="OZON_IMPORT_INFO_ERROR", error_message=str(exc))
+            raise
 
     ozon_items = parse_import_info_items(info)
     by_offer = {
@@ -102,6 +217,10 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
     except OzonSellerError:
         pass
 
+    # import/info 全空但商品已在架：改走 SKU 同步
+    if not by_offer and product_by_offer:
+        return _refresh_status_from_existing_offers(task_id)
+
     edit = get_product_edit(int(task["edit_id"]))
     stock_candidates: list[str] = []
     barcode_product_ids: list[str] = []
@@ -111,6 +230,42 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
             for item in items:
                 sku = str(item.get("seller_sku") or "").strip()
                 ozon_item = by_offer.get(sku)
+                product_info = product_by_offer.get(sku)
+                if ozon_item is None and product_info:
+                    # 导入明细暂无，但商品详情已有 → 按已有商品结算
+                    local_status = "listed" if is_ozon_product_sellable(product_info) else "pushed"
+                    pid = product_info.get("id") or product_info.get("product_id")
+                    try:
+                        pid_int = int(pid or 0)
+                    except (TypeError, ValueError):
+                        pid_int = 0
+                    if pid_int > 0 and local_status in {"pushed", "listed"}:
+                        barcode_product_ids.append(str(pid_int))
+                    if local_status in {"pushed", "listed"} and sku:
+                        stock_candidates.append(sku)
+                    cursor.execute(
+                        """
+                        UPDATE ozon_publish_item
+                        SET status = %s,
+                            ozon_product_id = %s,
+                            ozon_offer_id = %s,
+                            error_code = %s,
+                            error_message = %s,
+                            response_payload = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            local_status,
+                            str(pid_int) if pid_int > 0 else None,
+                            sku,
+                            None if local_status == "listed" else "NOT_SELLABLE_YET",
+                            None if local_status == "listed" else "商品已在 Ozon，但尚不可售（请确认库存/校验）",
+                            to_json({"product_info": product_info, "note": "synced_by_offer"}),
+                            item["id"],
+                        ),
+                    )
+                    continue
+
                 if ozon_item is None:
                     cursor.execute(
                         """
@@ -130,7 +285,6 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
                     continue
 
                 import_raw = map_ozon_import_raw_status(str(ozon_item.get("status") or ""))
-                product_info = product_by_offer.get(sku)
                 product_id = ozon_item.get("product_id") or (product_info or {}).get("id")
                 local_status, error_code, error_message = resolve_publish_item_status(
                     import_raw_status=import_raw,
@@ -175,6 +329,147 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
                     ),
                 )
 
+    return _finalize_after_status_sync(
+        task_id,
+        offer_ids=offer_ids,
+        product_by_offer=product_by_offer,
+        stock_candidates=stock_candidates,
+        barcode_product_ids=barcode_product_ids,
+        edit=edit,
+    )
+
+
+def _refresh_status_from_existing_offers(task_id: int) -> dict[str, Any]:
+    """无 import task_id 时：按 seller_sku 查 Ozon 已有商品并同步状态/库存。"""
+    task = get_ozon_publish_task(task_id)
+    items = task.get("items") or []
+    offer_ids = [str(item.get("seller_sku") or "").strip() for item in items if item.get("seller_sku")]
+    if not offer_ids:
+        raise ValueError("任务没有 SKU，无法从 Ozon 同步状态")
+
+    client = OzonSellerClient()
+    product_by_offer: dict[str, dict[str, Any]] = {}
+    try:
+        product_payload = client.get_product_info_list(offer_ids=offer_ids)
+        for product in parse_product_info_items(product_payload):
+            offer = str(product.get("offer_id") or "").strip()
+            if offer:
+                product_by_offer[offer] = product
+    except OzonSellerError as exc:
+        raise ValueError(f"按 SKU 查询 Ozon 商品失败：{exc}") from exc
+
+    if not product_by_offer:
+        raise ValueError(
+            "缺少 Ozon 导入任务 ID，且后台未查到这些 SKU。"
+            "若商品已在 Ozon 上架成功，请点「更新上架内容」重新推送；"
+            "否则请点「再次推送」"
+        )
+
+    edit = get_product_edit(int(task["edit_id"]))
+    stock_candidates: list[str] = []
+    barcode_product_ids: list[str] = []
+
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            for item in items:
+                sku = str(item.get("seller_sku") or "").strip()
+                product_info = product_by_offer.get(sku)
+                if not product_info:
+                    cursor.execute(
+                        """
+                        UPDATE ozon_publish_item
+                        SET status = %s,
+                            error_code = %s,
+                            error_message = %s,
+                            response_payload = %s
+                        WHERE id = %s
+                        """,
+                        (
+                            "awaiting_pull",
+                            "OFFER_NOT_FOUND",
+                            "Ozon 暂未查到该 SKU，请稍后重试或重新推送",
+                            to_json({"note": "offer_not_found_on_ozon"}),
+                            item["id"],
+                        ),
+                    )
+                    continue
+
+                local_status = "listed" if is_ozon_product_sellable(product_info) else "pushed"
+                pid = product_info.get("id") or product_info.get("product_id")
+                try:
+                    pid_int = int(pid or 0)
+                except (TypeError, ValueError):
+                    pid_int = 0
+                if pid_int > 0:
+                    barcode_product_ids.append(str(pid_int))
+                if sku:
+                    stock_candidates.append(sku)
+
+                # 补写最小提交快照，方便详情页展示
+                submission = item.get("submission_payload")
+                if not isinstance(submission, dict) or not submission.get("description_category_id"):
+                    try:
+                        built = build_import_items(edit)
+                        by_sku = {str(row.get("offer_id")): row for row in built}
+                        if sku in by_sku:
+                            cursor.execute(
+                                """
+                                UPDATE ozon_publish_item
+                                SET submission_payload = %s
+                                WHERE id = %s
+                                """,
+                                (to_json(by_sku[sku]), item["id"]),
+                            )
+                    except Exception:
+                        pass
+
+                cursor.execute(
+                    """
+                    UPDATE ozon_publish_item
+                    SET status = %s,
+                        ozon_product_id = %s,
+                        ozon_offer_id = %s,
+                        error_code = %s,
+                        error_message = %s,
+                        response_payload = %s
+                    WHERE id = %s
+                    """,
+                    (
+                        local_status,
+                        str(pid_int) if pid_int > 0 else None,
+                        sku,
+                        None if local_status == "listed" else "NOT_SELLABLE_YET",
+                        None if local_status == "listed" else "商品已在 Ozon，但尚不可售（请确认库存/校验）",
+                        to_json(
+                            {
+                                "product_info": product_info,
+                                "note": "synced_by_offer_without_import_task",
+                            }
+                        ),
+                        item["id"],
+                    ),
+                )
+
+    return _finalize_after_status_sync(
+        task_id,
+        offer_ids=offer_ids,
+        product_by_offer=product_by_offer,
+        stock_candidates=stock_candidates,
+        barcode_product_ids=barcode_product_ids,
+        edit=edit,
+    )
+
+
+def _finalize_after_status_sync(
+    task_id: int,
+    *,
+    offer_ids: list[str],
+    product_by_offer: dict[str, dict[str, Any]],
+    stock_candidates: list[str],
+    barcode_product_ids: list[str],
+    edit: dict[str, Any],
+) -> dict[str, Any]:
+    client = OzonSellerClient()
     barcode_result: dict[str, Any] | None = None
     if barcode_product_ids:
         try:
@@ -200,14 +495,28 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
 
     if stock_candidates or barcode_result is not None:
         refreshed_products: dict[str, dict[str, Any]] = {}
-        try:
-            again = client.get_product_info_list(offer_ids=offer_ids)
-            for product in parse_product_info_items(again):
-                offer = str(product.get("offer_id") or "").strip()
-                if offer:
-                    refreshed_products[offer] = product
-        except OzonSellerError:
-            refreshed_products = product_by_offer
+        for attempt in range(3):
+            if attempt > 0:
+                time.sleep(3)
+            try:
+                again = client.get_product_info_list(offer_ids=offer_ids)
+                for product in parse_product_info_items(again):
+                    offer = str(product.get("offer_id") or "").strip()
+                    if offer:
+                        refreshed_products[offer] = product
+            except OzonSellerError:
+                if not refreshed_products:
+                    refreshed_products = product_by_offer
+            if stock_candidates and all(
+                is_ozon_product_sellable(refreshed_products.get(sku) or product_by_offer.get(sku))
+                for sku in stock_candidates
+            ):
+                break
+            if stock_candidates and attempt < 2:
+                try:
+                    stock_result = _push_stocks_for_skus(edit, stock_candidates)
+                except Exception:
+                    pass
 
         with get_connection() as connection:
             with connection.cursor() as cursor:
@@ -246,24 +555,109 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
     return _recompute_task_totals(task_id)
 
 
+def _recover_import_task_id_from_edit(edit_id: int, current_task_id: int) -> int | None:
+    """同编辑的历史发布任务里找回 import task id。"""
+    from db.serialization import fetch_all
+
+    rows = fetch_all(
+        """
+        SELECT id, ozon_import_task_id
+        FROM ozon_publish_task
+        WHERE edit_id = %s
+          AND id <> %s
+          AND ozon_import_task_id IS NOT NULL
+        ORDER BY created_at DESC, id DESC
+        LIMIT 5
+        """,
+        (edit_id, current_task_id),
+    )
+    for row in rows or []:
+        try:
+            return int(row["ozon_import_task_id"])
+        except (TypeError, ValueError, KeyError):
+            continue
+    return None
+
+
 def _push_stocks_for_skus(edit: dict[str, Any], skus: list[str]) -> dict[str, Any] | None:
     import os
 
-    warehouse_id = None
     raw = (os.getenv("OZON_WAREHOUSE_ID") or "").strip()
+    warehouse_id = None
     if raw.isdigit():
         warehouse_id = int(raw)
     if not warehouse_id:
-        return None
+        raise RuntimeError("未配置 OZON_WAREHOUSE_ID，无法推送 rFBS 库存")
+
+    sku_set = set(skus)
     stocks = [
         row
         for row in build_stock_items(edit, warehouse_id)
-        if str(row.get("offer_id") or "") in set(skus)
+        if str(row.get("offer_id") or "") in sku_set
     ]
     if not stocks:
-        return None
+        raise RuntimeError("没有可推送的库存行（变体缺少 SKU）")
+
     client = OzonSellerClient()
-    return client.update_stocks(stocks)
+    result = client.update_stocks(stocks)
+    _assert_stock_update_ok(result, expected_skus=list(sku_set))
+    return result
+
+
+def _assert_stock_update_ok(result: dict[str, Any] | None, *, expected_skus: list[str]) -> None:
+    if not isinstance(result, dict):
+        raise RuntimeError("库存接口返回为空")
+    rows = result.get("result")
+    if not isinstance(rows, list):
+        rows = result.get("items") if isinstance(result.get("items"), list) else []
+    errors: list[str] = []
+    updated_offers: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        offer = str(row.get("offer_id") or "").strip()
+        if offer:
+            updated_offers.add(offer)
+        row_errors = row.get("errors") or []
+        if isinstance(row_errors, list) and row_errors:
+            messages = []
+            for err in row_errors:
+                if isinstance(err, dict):
+                    messages.append(str(err.get("message") or err.get("code") or err))
+                else:
+                    messages.append(str(err))
+            errors.append(f"{offer or '?'}: {'; '.join(messages)}")
+        elif row.get("updated") is False:
+            errors.append(f"{offer or '?'}: updated=false")
+    if errors:
+        raise RuntimeError("库存推送部分失败: " + "; ".join(errors[:5]))
+    missing = [sku for sku in expected_skus if sku and sku not in updated_offers]
+    # 有些响应不回 offer_id，缺回执时不硬失败
+    if missing and updated_offers:
+        raise RuntimeError(f"库存未覆盖 SKU: {', '.join(missing[:5])}")
+
+
+def _ensure_variant_stock_qty(edit_id: int, edit: dict[str, Any]) -> None:
+    """发布前把空/0 库存回落到默认上架库存，避免 Ozon 显示库存不足。"""
+    import os
+
+    from db.ozon_workflow import update_product_edit_variant
+    from services.ozon_pricing_service import DEFAULT_STOCK_QTY
+
+    try:
+        default_qty = int((os.getenv("OZON_DEFAULT_STOCK_QTY") or str(DEFAULT_STOCK_QTY)).strip())
+    except ValueError:
+        default_qty = DEFAULT_STOCK_QTY
+    if default_qty < 1:
+        default_qty = DEFAULT_STOCK_QTY
+
+    for variant in edit.get("variants") or []:
+        try:
+            qty = int(variant.get("quantity") or 0)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty < 1 and variant.get("id"):
+            update_product_edit_variant(int(variant["id"]), quantity=default_qty)
 
 
 def _submit_via_ozon_api(task_id: int) -> None:
@@ -488,7 +882,7 @@ def _recompute_task_totals(task_id: int) -> dict[str, Any]:
     items = task.get("items") or []
     statuses = [str(item.get("status") or "") for item in items]
     success_count = sum(1 for s in statuses if s in {"listed", "success", "completed"})
-    fail_count = sum(1 for s in statuses if s in {"failed", "pushed", "partial"})
+    fail_count = sum(1 for s in statuses if s == "failed")
     task_status = aggregate_task_status(statuses)
     finished = task_status in {"listed", "failed", "pushed", "completed", "partial"}
 

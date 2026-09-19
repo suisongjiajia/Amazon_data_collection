@@ -787,6 +787,148 @@ a:hover {
   margin-top: 12px;
 }
 
+.erp-field--full {
+  grid-column: 1 / -1;
+}
+
+.erp-image-editor {
+  display: grid;
+  gap: 12px;
+  margin-top: 8px;
+}
+
+.erp-image-editor__grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.erp-image-editor__item {
+  position: relative;
+  width: 112px;
+  border: 1px solid var(--erp-border);
+  border-radius: 10px;
+  background: #fff;
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+}
+
+.erp-image-editor__item.is-dragging {
+  opacity: 0.55;
+  border-color: var(--erp-primary);
+}
+
+.erp-image-editor__item img {
+  display: block;
+  width: 112px;
+  height: 112px;
+  object-fit: cover;
+  background: #f3f4f6;
+}
+
+.erp-image-editor__badge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: rgba(21, 83, 100, 0.92);
+  color: #fff;
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.erp-image-editor__badge--extra {
+  background: rgba(55, 65, 81, 0.88);
+}
+
+.erp-image-editor__hint {
+  margin: 6px 0 10px;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+.erp-image-editor__hint.is-ok {
+  color: #166534;
+}
+
+.erp-image-editor__hint.is-bad {
+  color: #991b1b;
+}
+
+.erp-image-editor__index {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 11px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.erp-image-editor__actions {
+  display: flex;
+  gap: 4px;
+  padding: 6px;
+  background: #fafafa;
+  border-top: 1px solid var(--erp-border);
+}
+
+.erp-image-editor__btn {
+  flex: 1;
+  border: 1px solid var(--erp-border);
+  background: #fff;
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  padding: 2px 0;
+  cursor: pointer;
+}
+
+.erp-image-editor__btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.erp-image-editor__btn--danger {
+  color: #991b1b;
+}
+
+.erp-image-editor__toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.erp-upload-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 32px;
+  padding: 0 12px;
+  border-radius: 8px;
+  background: var(--erp-primary);
+  color: #fff;
+  font-size: var(--erp-font-sm);
+  cursor: pointer;
+}
+
+.erp-upload-btn.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.erp-upload-btn input {
+  display: none;
+}
+
 .erp-stack {
   display: grid;
   gap: 16px;

@@ -70,6 +70,17 @@ class OzonCollectionRequest(BaseModel):
 
 class OzonCollectUrlRequest(BaseModel):
     url: str
+    max_products: int | None = None
+
+
+class ShopPipelineStartRequest(BaseModel):
+    shop_url: str
+    top_n: int | None = 50
+
+
+class ShopPipelineFromCollectionRequest(BaseModel):
+    collection_task_id: int
+    limit: int | None = None
 
 
 class SourcingSearchRequest(BaseModel):
@@ -95,12 +106,25 @@ class ProductEditVariantUpdateRequest(BaseModel):
 class ReviewDecisionRequest(BaseModel):
     note: str | None = None
     reviewer: str | None = "owner"
+    auto_publish: bool = True
+
+
+class ReviewVariantPriceItem(BaseModel):
+    variant_id: int
+    price: float
+
+
+class ReviewPriceUpdateRequest(BaseModel):
+    """审核中改价：可按变体分别改，或填 apply_all_price 统一改所有变体。"""
+    apply_all_price: float | None = None
+    variant_prices: list[ReviewVariantPriceItem] | None = None
 
 
 class OzonPublishRequest(BaseModel):
     edit_id: int
     shop_name: str | None = None
     simulate: bool = True
+    auto_follow: bool = True
 
 
 class AiProductEditRequest(BaseModel):

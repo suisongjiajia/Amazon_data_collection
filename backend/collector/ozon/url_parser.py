@@ -63,10 +63,11 @@ class OzonUrlParser:
         seller_match = re.search(r"/seller/([^/]+)", path, re.IGNORECASE)
         if seller_match:
             seller_slug = seller_match.group(1)
-            listing_path = f"/seller/{seller_slug}/"
+            # 店铺页默认按「流行 / Популярные」排序（sorting=score）
+            listing_path = f"/seller/{seller_slug}/?sorting=score"
             return OzonParseResult(
                 OzonUrlType.SELLER,
-                source_url,
+                f"https://www.ozon.ru{listing_path}",
                 listing_path,
                 seller_slug=seller_slug,
             )

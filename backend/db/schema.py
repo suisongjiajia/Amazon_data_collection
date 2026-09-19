@@ -14,6 +14,8 @@ ACTIVE_TABLES = [
     "review_record",
     "ozon_publish_task",
     "ozon_publish_item",
+    "shop_pipeline_job",
+    "shop_pipeline_item",
 ]
 
 # 已废弃：Amazon 选品/草稿/发布链路及历史遗留表
@@ -48,6 +50,8 @@ TABLE_COMMENTS: dict[str, str] = {
     "raw_product_variant": "原始商品变体表，记录 SKU/价格等变体快照",
     "sourcing_task": "1688 以图搜货任务表",
     "supplier_candidate": "供应商候选货源表",
+    "shop_pipeline_job": "店铺自动化流水线任务表",
+    "shop_pipeline_item": "店铺流水线商品明细表",
     "product_edit": "Ozon 商品编辑草稿表",
     "product_edit_variant": "Ozon 商品编辑变体表",
     "review_record": "商品审核记录表",
@@ -297,6 +301,55 @@ CREATE_TABLE_STATEMENTS = [
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
       COMMENT='Ozon 发布明细表'
     """,
+    """
+    CREATE TABLE IF NOT EXISTS shop_pipeline_job (
+        id                  BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+        job_no              VARCHAR(64)     NOT NULL COMMENT '流水线编号',
+        shop_url            VARCHAR(1024)   NOT NULL COMMENT '店铺链接',
+        seller_slug         VARCHAR(255)    NULL COMMENT '卖家 slug',
+        top_n               INT             NOT NULL DEFAULT 50 COMMENT '采集 Top N',
+        status              VARCHAR(32)     NOT NULL COMMENT '状态',
+        total_count         INT             NOT NULL DEFAULT 0 COMMENT '商品总数',
+        success_count       INT             NOT NULL DEFAULT 0 COMMENT '成功数',
+        fail_count          INT             NOT NULL DEFAULT 0 COMMENT '失败数',
+        collection_task_id  BIGINT UNSIGNED NULL COMMENT '关联采集任务',
+        error_message       TEXT            NULL COMMENT '错误信息',
+        started_at          DATETIME        NULL COMMENT '开始时间',
+        finished_at         DATETIME        NULL COMMENT '结束时间',
+        created_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        updated_at          DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_shop_pipeline_job_no (job_no),
+        KEY idx_shop_pipeline_job_status (status)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      COMMENT='店铺自动化流水线任务表'
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shop_pipeline_item (
+        id                      BIGINT UNSIGNED NOT NULL AUTO_INCREMENT COMMENT '主键',
+        job_id                  BIGINT UNSIGNED NOT NULL COMMENT '关联流水线任务',
+        raw_product_family_id   BIGINT UNSIGNED NOT NULL COMMENT '关联原始商品',
+        sales_rank              INT             NULL COMMENT '店铺流行排名',
+        status                  VARCHAR(32)     NOT NULL COMMENT '状态',
+        sourcing_task_id        BIGINT UNSIGNED NULL COMMENT '搜货任务',
+        selected_candidate_id   BIGINT UNSIGNED NULL COMMENT '默认选中供应商',
+        edit_id                 BIGINT UNSIGNED NULL COMMENT '编辑草稿',
+        publish_task_id         BIGINT UNSIGNED NULL COMMENT '发布任务',
+        content_score           DECIMAL(6, 2)   NULL COMMENT '内容评分',
+        heal_attempts           INT             NOT NULL DEFAULT 0 COMMENT '发布失败自愈次数',
+        error_message           TEXT            NULL COMMENT '错误信息',
+        stage_detail            JSON            NULL COMMENT '阶段详情',
+        created_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+        updated_at              DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+        PRIMARY KEY (id),
+        UNIQUE KEY uk_shop_pipeline_item_job_family (job_id, raw_product_family_id),
+        KEY idx_shop_pipeline_item_status (status),
+        KEY idx_shop_pipeline_item_edit (edit_id),
+        CONSTRAINT fk_shop_pipeline_item_job FOREIGN KEY (job_id) REFERENCES shop_pipeline_job (id) ON DELETE CASCADE,
+        CONSTRAINT fk_shop_pipeline_item_family FOREIGN KEY (raw_product_family_id) REFERENCES raw_product_family (id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+      COMMENT='店铺流水线商品明细表'
+    """,
 ]
 
 JSON_FIELDS = {
@@ -312,6 +365,7 @@ JSON_FIELDS = {
     "edit_images",
     "response_payload",
     "strategy_params",
+    "stage_detail",
 }
 
 
@@ -340,6 +394,8 @@ def drop_legacy_tables() -> None:
 
 def clear_all_data() -> None:
     truncate_order = [
+        "shop_pipeline_item",
+        "shop_pipeline_job",
         "ozon_publish_item",
         "ozon_publish_task",
         "review_record",

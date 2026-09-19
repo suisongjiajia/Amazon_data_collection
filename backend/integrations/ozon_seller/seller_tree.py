@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +9,14 @@ from typing import Any
 import requests
 
 from config import get_ozon_seller_ui_cookie
+from integrations.ozon_seller.cdp_seller import (
+    SELLER_HOME_URL,
+    pull_seller_cookie_from_cdp,
+    resolve_by_sku_via_cdp,
+    seller_cdp_enabled,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class OzonSellerTreeError(RuntimeError):
@@ -96,7 +105,7 @@ class OzonSellerTreeClient:
         base_url: str | None = None,
         timeout_seconds: int | None = None,
     ) -> None:
-        self.cookie = (cookie if cookie is not None else get_ozon_seller_ui_cookie()).strip()
+        self._cookie_override = (cookie or "").strip() if cookie is not None else None
         self.company_id = (
             company_id if company_id is not None else os.getenv("OZON_SELLER_CLIENT_ID", "")
         ).strip()
@@ -106,21 +115,76 @@ class OzonSellerTreeClient:
         self.timeout_seconds = timeout_seconds or int(
             os.getenv("OZON_SELLER_TIMEOUT_SECONDS", "60")
         )
+        self.cookie = ""
 
     def is_configured(self) -> bool:
-        return bool(self.cookie and self.company_id)
+        if not self.company_id:
+            return False
+        if self._cookie_override is not None:
+            return bool(self._cookie_override)
+        if seller_cdp_enabled():
+            return True
+        return bool(get_ozon_seller_ui_cookie())
 
     def resolve_by_sku(self, sku: str | int) -> ResolvedCategory:
-        if not self.is_configured():
+        if not self.company_id:
             raise OzonSellerTreeError(
-                "未配置 OZON_COOKIE（或 OZON_SELLER_CLIENT_ID），"
-                "无法自动解析 type_id / description_category_id"
+                "缺少 OZON_SELLER_CLIENT_ID，无法自动解析 type_id / description_category_id"
             )
 
         sku_text = str(sku).strip()
         if not sku_text.isdigit():
             raise OzonSellerTreeError(f"无效的 Ozon SKU: {sku}")
 
+        # 1) 优先：调试 Chrome 同源 fetch（最稳，免手贴 Cookie）
+        if seller_cdp_enabled() and self._cookie_override is None:
+            try:
+                payload = resolve_by_sku_via_cdp(sku_text, timeout_ms=self.timeout_seconds * 1000)
+                resolved = parse_resolved_categories_payload(payload, sku_text)
+                if resolved is not None:
+                    return resolved
+                raise OzonSellerTreeError(f"未能解析 SKU {sku_text} 的类目/类型（CDP）")
+            except Exception as exc:
+                logger.warning("seller-tree CDP resolve failed, fallback to cookie HTTP: %s", exc)
+                cdp_error = str(exc)
+                # 未登录 / 反爬时直接提示，避免再用过期 Cookie 打一次
+                lower = cdp_error.lower()
+                if (
+                    "challenge" in lower
+                    or "反爬" in cdp_error
+                    or "未登录" in cdp_error
+                    or "人机验证" in cdp_error
+                    or "unauthenticated" in lower
+                    or "401" in cdp_error
+                ):
+                    raise OzonSellerTreeError(cdp_error) from exc
+        else:
+            cdp_error = ""
+
+        # 2) Cookie HTTP：CDP Cookie > 显式传入 > .env
+        self.cookie = self._resolve_cookie()
+        if not self.cookie:
+            hint = cdp_error or (
+                f"请运行 start-ozon-chrome.ps1，在调试 Chrome 登录 {SELLER_HOME_URL}，"
+                "或配置 OZON_COOKIE"
+            )
+            raise OzonSellerTreeError(f"无法获取卖家后台登录态。{hint}")
+
+        return self._resolve_by_sku_http(sku_text)
+
+    def _resolve_cookie(self) -> str:
+        if self._cookie_override is not None:
+            return self._cookie_override
+        if seller_cdp_enabled():
+            try:
+                header = pull_seller_cookie_from_cdp(refresh=False)
+                if header:
+                    return header
+            except Exception as exc:
+                logger.warning("pull seller cookie from CDP failed: %s", exc)
+        return get_ozon_seller_ui_cookie()
+
+    def _resolve_by_sku_http(self, sku_text: str) -> ResolvedCategory:
         url = f"{self.base_url}/api/v1/seller-tree/resolve/by-sku"
         headers = {
             "Accept": "application/json, text/plain, */*",
@@ -137,7 +201,6 @@ class OzonSellerTreeClient:
                 "Chrome/152.0.0.0 Safari/537.36"
             ),
         }
-        # 官方请求体：ResolveBySKURequest.Skus（必须 1~1000 个）
         body = {"skus": [int(sku_text)]}
 
         try:
@@ -158,7 +221,12 @@ class OzonSellerTreeClient:
         if response.status_code >= 400:
             message = ""
             if isinstance(data, dict):
-                message = str(data.get("message") or data.get("error") or "")
+                message = str(data.get("message") or data.get("error") or data)
+                if data.get("challengeURL") or data.get("incidentId"):
+                    raise OzonSellerTreeError(
+                        "seller-tree 被反爬拦截。"
+                        f"请在调试 Chrome 打开并完成验证：{SELLER_HOME_URL}"
+                    )
             raise OzonSellerTreeError(
                 f"seller-tree 错误 {response.status_code}: {message or response.text[:300]}"
             )

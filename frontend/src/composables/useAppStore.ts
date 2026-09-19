@@ -45,7 +45,9 @@ export function useAppStore() {
   const stats = computed(() => ({
     products: state.value.ozonProducts.length,
     candidates: state.value.candidates.length,
-    pendingReview: state.value.edits.filter((item) => item.status === "pending_review").length,
+    pendingReview: state.value.edits.filter(
+      (item) => item.status === "pending_review" || item.status === "needs_fix",
+    ).length,
     approved: state.value.edits.filter((item) => item.status === "approved").length,
     publishTasks: state.value.publishTasks.length,
     collectionTasks: state.value.ozonTasks.length,
@@ -75,6 +77,9 @@ export function useAppStore() {
 
   function setModule(key: OzonViewKey): void {
     activeModule.value = key;
+    if (key === "review" || key === "shop-pipeline") {
+      void refreshAll();
+    }
   }
 
   function showNotice(message: string): void {

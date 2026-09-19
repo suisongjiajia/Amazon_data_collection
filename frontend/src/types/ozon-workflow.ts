@@ -1,4 +1,10 @@
-export type OzonViewKey = "ozon-collect" | "sourcing" | "product-edit" | "review" | "ozon-publish";
+export type OzonViewKey =
+  | "ozon-collect"
+  | "shop-pipeline"
+  | "sourcing"
+  | "product-edit"
+  | "review"
+  | "ozon-publish";
 
 export interface OzonViewDefinition {
   key: OzonViewKey;
@@ -37,6 +43,7 @@ export interface OzonProductFamily {
   variant_count: number;
   variants: Array<{
     id: number;
+    external_id?: string | null;
     price_text?: string | null;
     title?: string | null;
     size?: string | null;
@@ -197,6 +204,7 @@ export interface ProductEditVariant {
   price?: number | null;
   quantity: number;
   image_url?: string | null;
+  variant_attributes?: Record<string, string> | null;
 }
 
 export interface OzonPublishTask {
@@ -237,4 +245,41 @@ export interface OzonWorkflowState {
   candidates: SupplierCandidate[];
   edits: ProductEdit[];
   publishTasks: OzonPublishTask[];
+}
+
+export interface ShopPipelineItem {
+  id: number;
+  job_id: number;
+  raw_product_family_id: number;
+  sales_rank?: number | null;
+  status: string;
+  sourcing_task_id?: number | null;
+  selected_candidate_id?: number | null;
+  edit_id?: number | null;
+  publish_task_id?: number | null;
+  content_score?: number | null;
+  heal_attempts?: number | null;
+  error_message?: string | null;
+  stage_detail?: Record<string, unknown> | null;
+  family_title?: string | null;
+  family_main_image_url?: string | null;
+  family_external_id?: string | null;
+  family_source_url?: string | null;
+}
+
+export interface ShopPipelineJob {
+  id: number;
+  job_no: string;
+  shop_url: string;
+  seller_slug?: string | null;
+  top_n: number;
+  status: string;
+  total_count: number;
+  success_count: number;
+  fail_count: number;
+  collection_task_id?: number | null;
+  error_message?: string | null;
+  created_at: string;
+  finished_at?: string | null;
+  items?: ShopPipelineItem[];
 }

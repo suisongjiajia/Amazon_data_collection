@@ -4,6 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api import router as api_router
+from collector.ozon.browser_session import shutdown_ozon_browser_session
 from config import get_cors_origins
 import database
 
@@ -11,7 +12,10 @@ import database
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     database.init_db()
-    yield
+    try:
+        yield
+    finally:
+        shutdown_ozon_browser_session()
 
 
 app = FastAPI(title="Amazon Workflow V1", lifespan=lifespan)

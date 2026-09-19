@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 
-import { apiRequest } from "../lib/api";
+import { apiRequest, apiUploadImages } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
 import type { AiProductEditResponse, ListingPreview, OzonProductFamily, ProductEdit } from "../types/ozon-workflow";
@@ -20,6 +20,7 @@ interface EditDraftVariant {
   title: string;
   price: number | null;
   quantity: number;
+  variant_attributes: Record<string, string>;
 }
 
 interface EditDraft {
@@ -42,8 +43,29 @@ const draft = ref<EditDraft | null>(null);
 const saving = ref(false);
 const aiGenerating = ref(false);
 const buildingListing = ref(false);
+const submittingReview = ref(false);
+const suggestingPrice = ref(false);
+const rehostingImages = ref(false);
+const uploadingImages = ref(false);
+const showImageUrlEditor = ref(false);
+const dragImageIndex = ref<number | null>(null);
+const cancellingEdit = ref(false);
+const cancellingFamilyId = ref<number | null>(null);
 const listingPreview = ref<ListingPreview | null>(null);
 const resolvingCategory = ref(false);
+
+const isBusy = computed(
+  () =>
+    saving.value ||
+    aiGenerating.value ||
+    buildingListing.value ||
+    submittingReview.value ||
+    suggestingPrice.value ||
+    rehostingImages.value ||
+    uploadingImages.value ||
+    resolvingCategory.value ||
+    cancellingEdit.value,
+);
 
 const editByFamily = computed(() => {
   const map = new Map<number, ProductEdit>();
@@ -76,9 +98,89 @@ const imagesText = computed({
     draft.value.images = value
       .split("\n")
       .map((line) => line.trim())
-      .filter(Boolean);
+      .filter(Boolean)
+      .slice(0, 15);
   },
 });
+
+const MAX_IMAGES = 15;
+const REQUIRED_IMAGES = 5; // 1 主图 + 4 附图
+
+const imageRequirementMet = computed(() => (draft.value?.images.length ?? 0) >= REQUIRED_IMAGES);
+const imageRequirementHint = computed(() => {
+  const count = draft.value?.images.length ?? 0;
+  if (count >= REQUIRED_IMAGES) {
+    return `已满足：主图 1 + 附图 ${Math.min(count - 1, 4)}（当前共 ${count} 张）`;
+  }
+  return `还差 ${REQUIRED_IMAGES - count} 张：需主图 1 + 附图 4（当前 ${count}/${REQUIRED_IMAGES}）`;
+});
+
+function removeImageAt(index: number): void {
+  if (!draft.value) return;
+  draft.value.images = draft.value.images.filter((_, i) => i !== index);
+}
+
+function moveImage(from: number, to: number): void {
+  if (!draft.value) return;
+  if (from === to || from < 0 || to < 0) return;
+  const list = [...draft.value.images];
+  if (from >= list.length || to >= list.length) return;
+  const [item] = list.splice(from, 1);
+  list.splice(to, 0, item);
+  draft.value.images = list;
+}
+
+function onImageDragStart(index: number): void {
+  dragImageIndex.value = index;
+}
+
+function onImageDrop(index: number): void {
+  if (dragImageIndex.value == null) return;
+  moveImage(dragImageIndex.value, index);
+  dragImageIndex.value = null;
+}
+
+function onImageDragEnd(): void {
+  dragImageIndex.value = null;
+}
+
+async function uploadLocalImages(event: Event): Promise<void> {
+  const current = draft.value;
+  if (!current || uploadingImages.value) return;
+  const input = event.target as HTMLInputElement;
+  const selected = Array.from(input.files || []);
+  input.value = "";
+  if (!selected.length) return;
+
+  const remain = MAX_IMAGES - current.images.length;
+  if (remain <= 0) {
+    store.showError(`最多 ${MAX_IMAGES} 张图片，请先删除后再上传`);
+    return;
+  }
+  const files = selected.slice(0, remain);
+  if (selected.length > remain) {
+    store.showNotice(`已达上限，仅上传前 ${remain} 张`);
+  }
+
+  uploadingImages.value = true;
+  store.showNotice("正在上传图片到 OSS…");
+  try {
+    const sku = current.variants[0]?.sku || `OZON-${current.rawProductFamilyId}`;
+    const result = await apiUploadImages(files, { sku });
+    const next = [...current.images, ...result.images].slice(0, MAX_IMAGES);
+    current.images = next;
+    const failCount = result.errors?.length || 0;
+    store.showNotice(
+      failCount
+        ? `已上传 ${result.count} 张，失败 ${failCount} 张`
+        : `已上传 ${result.count} 张图片`,
+    );
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    uploadingImages.value = false;
+  }
+}
 
 const attributeEntries = computed(() => {
   if (!draft.value) return [];
@@ -154,26 +256,40 @@ function canCancelEdit(status: string | null): boolean {
 
 function canSubmitReview(draftValue: EditDraft): boolean {
   if (!draftValue.editId) return false;
+  if (draftValue.images.length < REQUIRED_IMAGES) return false;
   return draftValue.status === "listing_ready";
 }
 
 function canBuildListing(draftValue: EditDraft): boolean {
   if (!draftValue.editId) return false;
+  if (draftValue.images.length < REQUIRED_IMAGES) return false;
   const status = draftValue.status ?? "draft";
-  return status === "draft" || status === "editing" || status === "rejected" || status === "listing_ready";
+  return (
+    status === "draft" ||
+    status === "editing" ||
+    status === "rejected" ||
+    status === "needs_fix" ||
+    status === "listing_ready"
+  );
 }
 
 function buildDraftFromProduct(product: OzonProductFamily): EditDraft {
   const defaultTitle = product.title || "未命名商品";
   const variants =
     product.variants.length > 0
-      ? product.variants.map((variant) => ({
-          id: null,
-          sku: `OZON-${product.external_id || variant.id}`,
-          title: variant.title || defaultTitle,
-          price: parsePrice(variant.price_text),
-          quantity: 99,
-        }))
+      ? product.variants.map((variant) => {
+          const externalId = variant.external_id || String(variant.id);
+          const attrs = (variant.variant_attributes || {}) as Record<string, string>;
+          const label = Object.values(attrs).filter(Boolean).join(" / ");
+          return {
+            id: null,
+            sku: `OZON-${externalId}`,
+            title: variant.title || (label ? `${defaultTitle} (${label})` : defaultTitle),
+            price: parsePrice(variant.price_text),
+            quantity: 99,
+            variant_attributes: { ...attrs },
+          };
+        })
       : [
           {
             id: null,
@@ -181,6 +297,7 @@ function buildDraftFromProduct(product: OzonProductFamily): EditDraft {
             title: defaultTitle,
             price: parsePrice(product.price_text || product.variants?.[0]?.price_text),
             quantity: 99,
+            variant_attributes: {},
           },
         ];
 
@@ -224,8 +341,17 @@ function buildDraftFromEdit(edit: ProductEdit): EditDraft {
       title: variant.title || edit.title,
       price: variant.price,
       quantity: variant.quantity,
+      variant_attributes: { ...(variant.variant_attributes || {}) },
     })),
   };
+}
+
+function variantSpecText(variant: EditDraftVariant): string {
+  const attrs = variant.variant_attributes || {};
+  const parts = Object.entries(attrs)
+    .filter(([, value]) => String(value || "").trim())
+    .map(([key, value]) => `${key}: ${value}`);
+  return parts.length ? parts.join(" · ") : "-";
 }
 
 function applyAiSuggestion(response: AiProductEditResponse): void {
@@ -265,8 +391,9 @@ function applyAiSuggestion(response: AiProductEditResponse): void {
 
 async function generateWithAi(): Promise<void> {
   const current = draft.value;
-  if (!current) return;
+  if (!current || aiGenerating.value) return;
   aiGenerating.value = true;
+  store.showNotice("AI 生成中，请稍候…");
   try {
     const response = await apiRequest<AiProductEditResponse>("/api/product-edits/ai-generate", {
       method: "POST",
@@ -295,7 +422,9 @@ async function generateWithAi(): Promise<void> {
 
 async function suggestPrice(): Promise<void> {
   const current = draft.value;
-  if (!current) return;
+  if (!current || suggestingPrice.value) return;
+  suggestingPrice.value = true;
+  store.showNotice("正在计算建议价…");
   try {
     const result = await apiRequest<{
       pricing: {
@@ -328,12 +457,16 @@ async function suggestPrice(): Promise<void> {
     store.showNotice(`建议价 ${listPrice} ${currency}，库存 ${result.pricing.stock_qty}`);
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    suggestingPrice.value = false;
   }
 }
 
 async function rehostImages(): Promise<void> {
   const current = draft.value;
-  if (!current) return;
+  if (!current || rehostingImages.value) return;
+  rehostingImages.value = true;
+  store.showNotice("正在转存图片到 OSS…");
   try {
     const result = await apiRequest<{ images: string[]; count: number }>(
       "/api/product-edits/rehost-images",
@@ -350,6 +483,8 @@ async function rehostImages(): Promise<void> {
     store.showNotice(`已转存 ${result.count} 张图片到 OSS`);
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    rehostingImages.value = false;
   }
 }
 
@@ -389,8 +524,9 @@ async function autoResolveCategoryIfNeeded(): Promise<void> {
 
 async function resolveCategory(showSuccessNotice = true): Promise<void> {
   const current = draft.value;
-  if (!current) return;
+  if (!current || resolvingCategory.value) return;
   resolvingCategory.value = true;
+  if (showSuccessNotice) store.showNotice("正在获取类目…");
   try {
     // 未保存时先按 family 解析；已保存则写入 edit attributes
     if (!current.editId) {
@@ -449,8 +585,11 @@ async function cancelEdit(): Promise<void> {
     closeEdit();
     return;
   }
+  if (cancellingEdit.value) return;
 
   if (current.editId && canCancelEdit(current.status)) {
+    cancellingEdit.value = true;
+    store.showNotice("正在取消编辑…");
     try {
       await apiRequest(`/api/product-edits/${current.editId}`, { method: "DELETE" });
       store.showNotice("已取消编辑");
@@ -458,6 +597,8 @@ async function cancelEdit(): Promise<void> {
     } catch (err) {
       store.showError(err instanceof Error ? err.message : String(err));
       return;
+    } finally {
+      cancellingEdit.value = false;
     }
   }
 
@@ -466,7 +607,9 @@ async function cancelEdit(): Promise<void> {
 
 async function cancelEditFromList(familyId: number): Promise<void> {
   const edit = editForFamily(familyId);
-  if (!edit || !canCancelEdit(edit.status)) return;
+  if (!edit || !canCancelEdit(edit.status) || cancellingFamilyId.value != null) return;
+  cancellingFamilyId.value = familyId;
+  store.showNotice("正在取消编辑…");
   try {
     await apiRequest(`/api/product-edits/${edit.id}`, { method: "DELETE" });
     store.showNotice("已取消编辑");
@@ -476,14 +619,17 @@ async function cancelEditFromList(familyId: number): Promise<void> {
     await store.refreshAll();
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    cancellingFamilyId.value = null;
   }
 }
 
 async function saveEdit(): Promise<void> {
   const current = draft.value;
-  if (!current) return;
+  if (!current || saving.value) return;
 
   saving.value = true;
+  store.showNotice("正在保存产品信息…");
   try {
     let editId = current.editId;
     if (!editId) {
@@ -519,6 +665,7 @@ async function saveEdit(): Promise<void> {
           title: variant.title,
           price: variant.price,
           quantity: variant.quantity,
+          variant_attributes: variant.variant_attributes || {},
         }),
       });
     }
@@ -543,7 +690,13 @@ async function buildListing(): Promise<void> {
     store.showError("请先保存产品信息，再生成 Listing");
     return;
   }
+  if (current.images.length < REQUIRED_IMAGES) {
+    store.showError(`图片不足：需要 1 张主图 + 4 张附图（共 ${REQUIRED_IMAGES} 张），当前 ${current.images.length} 张`);
+    return;
+  }
+  if (buildingListing.value) return;
   buildingListing.value = true;
+  store.showNotice("正在生成 Listing…");
   try {
     const result = await apiRequest<ListingPreview & { edit?: ProductEdit; saved?: boolean }>(
       `/api/product-edits/${current.editId}/build-listing`,
@@ -571,18 +724,31 @@ async function submitReview(): Promise<void> {
     store.showError("请先保存并生成 Listing");
     return;
   }
+  if (current.images.length < REQUIRED_IMAGES) {
+    store.showError(`图片不足：需要 1 张主图 + 4 张附图（共 ${REQUIRED_IMAGES} 张），当前 ${current.images.length} 张`);
+    return;
+  }
   if (current.status !== "listing_ready") {
     store.showError("请先生成 Listing 并通过校验后再提交审核");
     return;
   }
+  if (submittingReview.value) return;
+  submittingReview.value = true;
+  store.showNotice("正在提交审核…");
   try {
     await apiRequest(`/api/product-edits/${current.editId}/submit-review`, { method: "POST" });
-    store.showNotice("Listing 已提交审核");
+    // 先本地切换状态，立刻隐藏按钮，避免连点
+    if (draft.value?.editId === current.editId) {
+      draft.value.status = "pending_review";
+    }
+    store.showNotice("Listing 已提交审核，请到「审核」模块处理");
     await store.refreshAll();
     const fresh = editForFamily(current.rawProductFamilyId);
     if (fresh) draft.value = buildDraftFromEdit(fresh);
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    submittingReview.value = false;
   }
 }
 </script>
@@ -605,9 +771,10 @@ async function submitReview(): Promise<void> {
           v-if="draft && canCancelEdit(draft.status)"
           variant="danger"
           size="sm"
+          :disabled="cancellingEdit || isBusy"
           @click="cancelEdit"
         >
-          取消编辑
+          {{ cancellingEdit ? "取消中…" : "取消编辑" }}
         </ErpButton>
       </template>
     </ErpPageHeader>
@@ -656,9 +823,10 @@ async function submitReview(): Promise<void> {
                       v-if="editForFamily(item.id) && canCancelEdit(editForFamily(item.id)!.status)"
                       variant="ghost"
                       size="sm"
+                      :disabled="cancellingFamilyId === item.id"
                       @click="cancelEditFromList(item.id)"
                     >
-                      取消编辑
+                      {{ cancellingFamilyId === item.id ? "取消中…" : "取消编辑" }}
                     </ErpButton>
                   </div>
                 </td>
@@ -695,16 +863,13 @@ async function submitReview(): Promise<void> {
 
       <ErpCard title="产品信息" description="此处保存的是产品内容；上架包请点「生成 Listing」">
         <div class="erp-editor-actions" style="margin-bottom: 14px">
-          <ErpButton :disabled="aiGenerating || saving" @click="generateWithAi">
+          <ErpButton :disabled="isBusy" @click="generateWithAi">
             {{ aiGenerating ? "AI 生成中…" : "AI 一键生成" }}
           </ErpButton>
-          <ErpButton variant="secondary" :disabled="saving" @click="suggestPrice">计算建议价</ErpButton>
-          <ErpButton variant="secondary" :disabled="saving" @click="rehostImages">图片转存 OSS</ErpButton>
-          <ErpButton
-            variant="secondary"
-            :disabled="resolvingCategory || saving"
-            @click="resolveCategory(true)"
-          >
+          <ErpButton variant="secondary" :disabled="isBusy" @click="suggestPrice">
+            {{ suggestingPrice ? "计算中…" : "计算建议价" }}
+          </ErpButton>
+          <ErpButton variant="secondary" :disabled="isBusy" @click="resolveCategory(true)">
             {{ resolvingCategory ? "获取类目中…" : "自动获取类目" }}
           </ErpButton>
         </div>
@@ -729,10 +894,103 @@ async function submitReview(): Promise<void> {
             <span>卖点（每行一条）</span>
             <textarea v-model="bulletPointsText" rows="5" />
           </label>
-          <label class="erp-field">
-            <span>图片 URL（每行一条）</span>
-            <textarea v-model="imagesText" rows="4" />
-          </label>
+          <div class="erp-field erp-field--full">
+            <span>
+              商品图片（必须 1 主图 + 4 附图，最多 {{ MAX_IMAGES }} 张；第一张为主图，可拖拽排序）
+            </span>
+            <p
+              class="erp-image-editor__hint"
+              :class="{ 'is-ok': imageRequirementMet, 'is-bad': !imageRequirementMet }"
+            >
+              {{ imageRequirementHint }}
+            </p>
+            <div class="erp-image-editor">
+              <div v-if="draft.images.length" class="erp-image-editor__grid">
+                <div
+                  v-for="(url, index) in draft.images"
+                  :key="`${url}-${index}`"
+                  class="erp-image-editor__item"
+                  :class="{ 'is-dragging': dragImageIndex === index }"
+                  draggable="true"
+                  @dragstart="onImageDragStart(index)"
+                  @dragover.prevent
+                  @drop.prevent="onImageDrop(index)"
+                  @dragend="onImageDragEnd"
+                >
+                  <img :src="url" :alt="`图片 ${index + 1}`" />
+                  <span v-if="index === 0" class="erp-image-editor__badge">主图</span>
+                  <span v-else-if="index <= 4" class="erp-image-editor__badge erp-image-editor__badge--extra">
+                    附图{{ index }}
+                  </span>
+                  <span class="erp-image-editor__index">{{ index + 1 }}</span>
+                  <div class="erp-image-editor__actions">
+                    <button
+                      type="button"
+                      class="erp-image-editor__btn"
+                      :disabled="index === 0 || isBusy"
+                      title="前移"
+                      @click="moveImage(index, index - 1)"
+                    >
+                      ←
+                    </button>
+                    <button
+                      type="button"
+                      class="erp-image-editor__btn"
+                      :disabled="index >= draft.images.length - 1 || isBusy"
+                      title="后移"
+                      @click="moveImage(index, index + 1)"
+                    >
+                      →
+                    </button>
+                    <button
+                      type="button"
+                      class="erp-image-editor__btn erp-image-editor__btn--danger"
+                      :disabled="isBusy"
+                      title="删除"
+                      @click="removeImageAt(index)"
+                    >
+                      删
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <ErpEmpty v-else message="暂无图片，请本地上传或粘贴 URL" />
+
+              <div class="erp-image-editor__toolbar">
+                <label class="erp-upload-btn" :class="{ 'is-disabled': isBusy || draft.images.length >= MAX_IMAGES }">
+                  {{ uploadingImages ? "上传中…" : "本地上传" }}
+                  <input
+                    type="file"
+                    accept="image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,.gif"
+                    multiple
+                    :disabled="isBusy || draft.images.length >= MAX_IMAGES"
+                    @change="uploadLocalImages"
+                  />
+                </label>
+                <ErpButton
+                  variant="secondary"
+                  size="sm"
+                  :disabled="isBusy || !draft.images.length"
+                  @click="rehostImages"
+                >
+                  {{ rehostingImages ? "转存中…" : "现有链接转存 OSS" }}
+                </ErpButton>
+                <ErpButton
+                  variant="ghost"
+                  size="sm"
+                  :disabled="isBusy"
+                  @click="showImageUrlEditor = !showImageUrlEditor"
+                >
+                  {{ showImageUrlEditor ? "收起 URL 编辑" : "高级：编辑 URL" }}
+                </ErpButton>
+              </div>
+
+              <label v-if="showImageUrlEditor" class="erp-field" style="margin-top: 10px">
+                <span>图片 URL（每行一条）</span>
+                <textarea v-model="imagesText" rows="4" placeholder="https://..." />
+              </label>
+            </div>
+          </div>
         </div>
 
         <div class="erp-editor-grid" style="margin-top: 14px">
@@ -782,7 +1040,8 @@ async function submitReview(): Promise<void> {
           </label>
         </div>
         <p class="erp-detail-text" style="margin-top: 8px">
-          长宽高与重量用于 Ozon 创建 SKU，必须按实货填写；系统不会自动写死默认值。
+          长宽高填「包装后」尺寸（不是展开尺寸），重量填含包装克数。
+          体积很大但重量很轻时，Ozon 会报「尺寸或重量不正确」。
         </p>
 
         <div v-if="otherAttributeEntries.length" class="erp-detail-grid" style="margin-top: 14px">
@@ -811,6 +1070,7 @@ async function submitReview(): Promise<void> {
             <thead>
               <tr>
                 <th>SKU</th>
+                <th>规格</th>
                 <th>变体标题</th>
                 <th>{{ priceCurrencyLabel }}</th>
                 <th>库存</th>
@@ -819,6 +1079,7 @@ async function submitReview(): Promise<void> {
             <tbody>
               <tr v-for="(variant, index) in draft.variants" :key="variant.id ?? `${variant.sku}-${index}`">
                 <td>{{ variant.sku }}</td>
+                <td>{{ variantSpecText(variant) }}</td>
                 <td><input v-model="variant.title" type="text" /></td>
                 <td><input v-model.number="variant.price" type="number" min="0" step="1" /></td>
                 <td><input v-model.number="variant.quantity" type="number" min="0" /></td>
@@ -828,17 +1089,23 @@ async function submitReview(): Promise<void> {
         </div>
 
         <div class="erp-editor-actions" style="margin-top: 14px">
-          <ErpButton variant="secondary" :disabled="saving" @click="saveEdit">
+          <ErpButton variant="secondary" :disabled="isBusy" @click="saveEdit">
             {{ saving ? "保存中…" : "保存产品信息" }}
           </ErpButton>
           <ErpButton
-            v-if="canBuildListing(draft)"
-            :disabled="buildingListing || saving"
+            v-if="draft.editId && ['draft','editing','rejected','needs_fix','listing_ready'].includes(draft.status ?? 'draft')"
+            :disabled="isBusy || !imageRequirementMet"
             @click="buildListing"
           >
-            {{ buildingListing ? "生成中…" : "生成 Listing" }}
+            {{ buildingListing ? "生成中…" : imageRequirementMet ? "生成 Listing" : `补齐图片后再生成（${draft.images.length}/5）` }}
           </ErpButton>
-          <ErpButton v-if="canSubmitReview(draft)" @click="submitReview">提交审核</ErpButton>
+          <ErpButton
+            v-if="canSubmitReview(draft) || submittingReview"
+            :disabled="isBusy || !imageRequirementMet"
+            @click="submitReview"
+          >
+            {{ submittingReview ? "提交中…" : "提交审核" }}
+          </ErpButton>
         </div>
       </ErpCard>
 

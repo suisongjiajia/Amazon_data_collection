@@ -19,6 +19,8 @@ const module = getModuleDefinition("sourcing");
 const selectedFamilyId = ref<number | null>(null);
 const detailLoading = ref(false);
 const detail = ref<SourcingDetail | null>(null);
+const searchingFamilyId = ref<number | null>(null);
+const selectingCandidateId = ref<number | null>(null);
 
 const candidateCountByFamily = computed(() => {
   const counts = new Map<number, number>();
@@ -37,6 +39,8 @@ const selectedCountByFamily = computed(() => {
   return counts;
 });
 
+const isSearching = computed(() => searchingFamilyId.value != null);
+
 function productPrice(item: { price_text?: string | null; variants?: Array<{ price_text?: string | null }> }): string {
   return item.price_text || item.variants?.[0]?.price_text || "-";
 }
@@ -51,6 +55,14 @@ function selectedCount(familyId: number): number {
 
 function hasSuppliers(familyId: number): boolean {
   return candidateCount(familyId) > 0;
+}
+
+function isFamilySearching(familyId: number): boolean {
+  return searchingFamilyId.value === familyId;
+}
+
+function searchButtonLabel(familyId: number): string {
+  return isFamilySearching(familyId) ? "搜货中…" : "搜 1688";
 }
 
 function supplierRegion(candidate: SupplierCandidate): string {
@@ -85,6 +97,9 @@ function closeDetail(): void {
 }
 
 async function searchSuppliers(familyId: number): Promise<void> {
+  if (searchingFamilyId.value != null) return;
+  searchingFamilyId.value = familyId;
+  store.showNotice("正在以图搜货，请稍候…");
   try {
     await apiRequest("/api/sourcing/search", {
       method: "POST",
@@ -97,10 +112,15 @@ async function searchSuppliers(familyId: number): Promise<void> {
     }
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    searchingFamilyId.value = null;
   }
 }
 
 async function selectCandidate(candidateId: number): Promise<void> {
+  if (selectingCandidateId.value != null) return;
+  selectingCandidateId.value = candidateId;
+  store.showNotice("正在选定供应商…");
   try {
     await apiRequest(`/api/sourcing/candidates/${candidateId}/select`, { method: "POST" });
     store.showNotice("已选定供应商");
@@ -110,10 +130,15 @@ async function selectCandidate(candidateId: number): Promise<void> {
     }
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    selectingCandidateId.value = null;
   }
 }
 
 async function unselectCandidate(candidateId: number): Promise<void> {
+  if (selectingCandidateId.value != null) return;
+  selectingCandidateId.value = candidateId;
+  store.showNotice("正在取消选定…");
   try {
     await apiRequest(`/api/sourcing/candidates/${candidateId}/unselect`, { method: "POST" });
     store.showNotice("已取消选定");
@@ -123,6 +148,8 @@ async function unselectCandidate(candidateId: number): Promise<void> {
     }
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    selectingCandidateId.value = null;
   }
 }
 </script>
@@ -148,6 +175,9 @@ async function unselectCandidate(candidateId: number): Promise<void> {
       />
 
       <ErpCard title="商品货源" :description="`${store.state.value.ozonProducts.length} 条`" padding="none">
+        <div v-if="isSearching" class="sourcing-searching-banner">
+          正在以图搜货中，通常需要十几秒，请勿重复点击…
+        </div>
         <div v-if="store.state.value.ozonProducts.length" class="erp-table-wrap">
           <table class="erp-table">
             <thead>
@@ -160,7 +190,11 @@ async function unselectCandidate(candidateId: number): Promise<void> {
               </tr>
             </thead>
             <tbody>
-              <tr v-for="item in store.state.value.ozonProducts" :key="item.id">
+              <tr
+                v-for="item in store.state.value.ozonProducts"
+                :key="item.id"
+                :class="{ 'erp-row--busy': isFamilySearching(item.id) }"
+              >
                 <td>
                   <ErpProductCell
                     :image-url="item.main_image_url"
@@ -173,16 +207,21 @@ async function unselectCandidate(candidateId: number): Promise<void> {
                 <td>{{ selectedCount(item.id) }}</td>
                 <td>
                   <div class="erp-table-actions">
-                    <ErpButton variant="secondary" size="sm" @click="openDetail(item.id)">
+                    <ErpButton
+                      variant="secondary"
+                      size="sm"
+                      :disabled="isSearching"
+                      @click="openDetail(item.id)"
+                    >
                       {{ hasSuppliers(item.id) ? "查看货源" : "查看" }}
                     </ErpButton>
                     <ErpButton
-                      v-if="!hasSuppliers(item.id)"
+                      v-if="!hasSuppliers(item.id) || isFamilySearching(item.id)"
                       size="sm"
-                      :disabled="store.loading.value"
+                      :disabled="isSearching"
                       @click="searchSuppliers(item.id)"
                     >
-                      搜 1688
+                      {{ searchButtonLabel(item.id) }}
                     </ErpButton>
                   </div>
                 </td>
@@ -224,12 +263,12 @@ async function unselectCandidate(candidateId: number): Promise<void> {
                     Ozon 商品页
                   </a>
                   <ErpButton
-                    v-if="!detail.candidates.length"
+                    v-if="!detail.candidates.length || isFamilySearching(detail.product.id)"
                     size="sm"
-                    :disabled="store.loading.value"
+                    :disabled="isSearching"
                     @click="searchSuppliers(detail.product.id)"
                   >
-                    搜 1688
+                    {{ searchButtonLabel(detail.product.id) }}
                   </ErpButton>
                 </div>
               </div>
@@ -279,11 +318,22 @@ async function unselectCandidate(candidateId: number): Promise<void> {
                 />
                 <div class="erp-table-actions">
                   <ErpBadge :status="item.status" />
-                  <ErpButton v-if="item.status !== 'selected'" size="sm" @click="selectCandidate(item.id)">
-                    选定
+                  <ErpButton
+                    v-if="item.status !== 'selected'"
+                    size="sm"
+                    :disabled="selectingCandidateId != null || isSearching"
+                    @click="selectCandidate(item.id)"
+                  >
+                    {{ selectingCandidateId === item.id ? "选定中…" : "选定" }}
                   </ErpButton>
-                  <ErpButton v-else size="sm" variant="ghost" @click="unselectCandidate(item.id)">
-                    取消选定
+                  <ErpButton
+                    v-else
+                    size="sm"
+                    variant="ghost"
+                    :disabled="selectingCandidateId != null || isSearching"
+                    @click="unselectCandidate(item.id)"
+                  >
+                    {{ selectingCandidateId === item.id ? "取消中…" : "取消选定" }}
                   </ErpButton>
                 </div>
               </div>
@@ -299,15 +349,38 @@ async function unselectCandidate(candidateId: number): Promise<void> {
           <ErpEmpty v-else message="暂无货源">
             <ErpButton
               size="sm"
-              :disabled="store.loading.value"
+              :disabled="isSearching"
               style="margin-top: 12px"
               @click="searchSuppliers(detail.product.id)"
             >
-              搜 1688
+              {{ searchButtonLabel(detail.product.id) }}
             </ErpButton>
+            <p v-if="isFamilySearching(detail.product.id)" class="erp-detail-text" style="margin-top: 8px">
+              正在以图搜货中，请稍候…
+            </p>
           </ErpEmpty>
         </ErpCard>
       </template>
     </template>
   </div>
 </template>
+
+<style scoped>
+.sourcing-searching-banner {
+  margin: 12px 16px 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 13px;
+  line-height: 1.4;
+}
+
+:deep(.erp-row--busy) {
+  background: #f8fafc;
+}
+
+:deep(.erp-row--busy) .erp-btn--primary {
+  opacity: 0.85;
+}
+</style>

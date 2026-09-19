@@ -9,16 +9,21 @@ from db.ozon_workflow import list_supplier_candidates
 from integrations.deepseek.client import DeepSeekClient, DeepSeekError
 from services.sourcing_service import _enrich_ozon_family_for_display
 
-SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的 Ozon 商品信息、规格和 1688 货源，生成可直接用于 Ozon Seller API 上架的俄语商品内容。
+SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的 Ozon 商品信息、规格、类目属性清单和 1688 货源，生成可直接用于 Ozon Seller API 上架的俄语商品内容。
 
 要求：
 1. 标题、描述、卖点 bullet_points 使用俄语，符合 Ozon 规范，标题简洁有卖点（不超过 200 字符）。
-2. description 为纯文本，可包含换行，不要 HTML。
-3. bullet_points 3-7 条，突出材质、兼容性、包装数量等。
-4. attributes 保留并补充关键规格（类型、型号、尺寸、重量、材质、品牌等），键名用俄语或通用英文。
-5. search_keywords 为俄语搜索词数组。
+2. description 为纯文本，可包含换行，不要 HTML；建议 600～1500 字符，覆盖用途、材质、尺寸、场景、保养。
+3. bullet_points 5-8 条，突出材质、适用宠物、保暖/防水、尺寸、包装等。
+4. attributes 必须尽量填满 context.ozon_fillable_attributes 中的每一项：
+   - 键名必须与清单中的俄语属性名完全一致（不要用中文键名）
+   - 值为俄语或数字字符串；字典枚举类属性填常见俄语选项（如 Страна-изготовитель=Китай，Нужен код маркировки=Нет）
+   - 重量相关用克（例如 Вес товара, г=500）；包装尺寸用厘米字符串如 36x36x36
+   - 件数/数量类默认 1；#Хештеги 用空格分隔的俄语标签；Аннотация 为 1～2 句简介
+   - 无法合理推断的属性可省略，不要编造危险/违法信息
+5. search_keywords 为俄语搜索词数组（8～15 个）。
 6. category_hint 为建议的 Ozon 类目路径（俄语或中文均可）。
-7. variants 数组：每个变体含 title（俄语）。不要自行编造 price / quantity，价格与库存由系统公式计算。
+7. variants 数组：每个变体含 title（俄语，可带尺寸区分）。不要自行编造 price / quantity。
 8. listing_notes 用中文简要说明文案注意点（不要写定价公式）。
 
 只输出 JSON 对象，不要 markdown，字段：
@@ -26,7 +31,7 @@ SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的 
   "title": "string",
   "description": "string",
   "bullet_points": ["string"],
-  "attributes": {"string": "string"},
+  "attributes": {"俄语属性名": "string"},
   "search_keywords": ["string"],
   "category_hint": "string",
   "variants": [{"title": "string"}],
@@ -69,6 +74,11 @@ def _build_ai_context(raw_product_family_id: int) -> dict[str, Any]:
             }
         )
 
+    fillable_attributes = _load_fillable_attribute_names(
+        product.get("description_category_id") or family.get("category_id"),
+        product.get("type_id") or family.get("type_id"),
+    )
+
     return {
         "ozon_product": {
             "external_id": product.get("external_id"),
@@ -87,9 +97,43 @@ def _build_ai_context(raw_product_family_id: int) -> dict[str, Any]:
             "rating": product.get("rating"),
             "review_count": product.get("review_count"),
             "source_url": product.get("source_url"),
+            "variants": [
+                {
+                    "external_id": v.get("external_id"),
+                    "title": v.get("title"),
+                    "variant_attributes": v.get("variant_attributes") or {},
+                    "price_text": v.get("price_text"),
+                }
+                for v in (product.get("variants") or family.get("variants") or [])[:12]
+            ],
         },
+        "ozon_fillable_attributes": fillable_attributes,
         "suppliers_1688": suppliers,
     }
+
+
+def _load_fillable_attribute_names(category_id: Any, type_id: Any) -> list[str]:
+    try:
+        cat = int(str(category_id))
+        typ = int(str(type_id))
+    except (TypeError, ValueError):
+        return []
+    try:
+        from services.ozon_attribute_fill import fetch_category_attributes
+
+        schema = fetch_category_attributes(cat, typ)
+    except Exception:
+        return []
+    names: list[str] = []
+    for attr in schema:
+        name = str(attr.get("name") or attr.get("description") or "").strip()
+        if not name:
+            continue
+        lower = name.lower()
+        if lower in {"бренд", "brand"}:
+            continue
+        names.append(name)
+    return names[:80]
 
 
 def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[str, Any]:

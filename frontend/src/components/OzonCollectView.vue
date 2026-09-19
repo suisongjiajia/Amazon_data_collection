@@ -18,6 +18,7 @@ const module = getModuleDefinition("ozon-collect");
 const collectionUrl = ref("");
 const collecting = ref(false);
 const retryingTaskId = ref<number | null>(null);
+const pipelineTaskId = ref<number | null>(null);
 
 function productCollectUrl(item: Pick<OzonProductFamily, "source_url" | "external_id">): string | null {
   const direct = item.source_url?.trim();
@@ -59,7 +60,9 @@ async function submitCollection(): Promise<void> {
     store.showError("请先输入 Ozon 链接");
     return;
   }
+  if (collecting.value) return;
   collecting.value = true;
+  store.showNotice("正在采集，请稍候…");
   try {
     await apiRequest("/api/ozon/collect", {
       method: "POST",
@@ -81,7 +84,9 @@ async function retryTask(task: OzonCollectionTask): Promise<void> {
     store.showError("该任务没有可重试的链接或策略");
     return;
   }
+  if (retryingTaskId.value != null || collecting.value) return;
   retryingTaskId.value = task.id;
+  store.showNotice("正在重新采集…");
   try {
     await apiRequest(`/api/ozon/collections/${task.id}/retry`, { method: "POST" });
     store.showNotice(`已重新采集：${task.task_no}`);
@@ -91,6 +96,32 @@ async function retryTask(task: OzonCollectionTask): Promise<void> {
     await store.refreshAll();
   } finally {
     retryingTaskId.value = null;
+  }
+}
+
+async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
+  if (task.status !== "completed" || !task.success_count) {
+    store.showError("仅已完成且有商品的采集任务可转入流水线");
+    return;
+  }
+  if (pipelineTaskId.value != null || collecting.value) return;
+  pipelineTaskId.value = task.id;
+  store.showNotice("正在用已采商品启动流水线（不再重采）…");
+  try {
+    const job = await apiRequest<{ job_no: string }>("/api/shop-pipeline/from-collection", {
+      method: "POST",
+      body: JSON.stringify({
+        collection_task_id: task.id,
+        limit: task.success_count || undefined,
+      }),
+    });
+    store.showNotice(`流水线已启动：${job.job_no}，可到「店铺流水线」查看进度`);
+    store.setModule("shop-pipeline");
+    await store.refreshAll();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    pipelineTaskId.value = null;
   }
 }
 </script>
@@ -206,20 +237,30 @@ async function retryTask(task: OzonCollectionTask): Promise<void> {
               <td><ErpBadge :status="task.status" /></td>
               <td>{{ task.success_count }} / {{ task.total_count }}</td>
               <td>
-                <ErpButton
-                  size="sm"
-                  variant="secondary"
-                  :disabled="!canRetry(task) || retryingTaskId === task.id || collecting"
-                  @click="retryTask(task)"
-                >
-                  {{
-                    retryingTaskId === task.id
-                      ? "重采中…"
-                      : task.status === "failed"
-                        ? "重新采集"
-                        : "再采一次"
-                  }}
-                </ErpButton>
+                <div class="task-actions">
+                  <ErpButton
+                    v-if="task.status === 'completed' && task.success_count > 0"
+                    size="sm"
+                    :disabled="pipelineTaskId === task.id || collecting"
+                    @click="startPipelineFromTask(task)"
+                  >
+                    {{ pipelineTaskId === task.id ? "启动中…" : "跑流水线" }}
+                  </ErpButton>
+                  <ErpButton
+                    size="sm"
+                    variant="secondary"
+                    :disabled="!canRetry(task) || retryingTaskId === task.id || collecting"
+                    @click="retryTask(task)"
+                  >
+                    {{
+                      retryingTaskId === task.id
+                        ? "重采中…"
+                        : task.status === "failed"
+                          ? "重新采集"
+                          : "再采一次"
+                    }}
+                  </ErpButton>
+                </div>
               </td>
             </tr>
           </tbody>
@@ -241,5 +282,11 @@ async function retryTask(task: OzonCollectionTask): Promise<void> {
   color: #991b1b;
   font-size: 12px;
   line-height: 1.4;
+}
+
+.task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 </style>

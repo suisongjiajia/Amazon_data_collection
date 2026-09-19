@@ -26,3 +26,9 @@ frontend/dist/
 ### Logs ###
 logs/
 *.log
+
+### Ozon browser profile / diag ###
+.ozon-chrome-profile/
+.ozon-browser-profile/
+backend/collector/ozon/_ozon_*.json
+backend/collector/ozon/_diag_ozon_browser*.py

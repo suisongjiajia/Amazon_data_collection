@@ -17,18 +17,43 @@ function buildApiUrl(path: string): string {
 }
 
 export async function apiRequest<T>(url: string, init?: RequestInit): Promise<T> {
+  const isFormData = typeof FormData !== "undefined" && init?.body instanceof FormData;
+  const headers: HeadersInit = {
+    ...(isFormData ? {} : { "Content-Type": "application/json" }),
+    ...(init?.headers ?? {}),
+  };
+
   const response = await fetch(buildApiUrl(url), {
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
-    },
     ...init,
+    headers,
   });
 
   if (!response.ok) {
     const payload = await response.json().catch(() => null);
-    throw new Error(payload?.detail ?? `Request failed: ${response.status}`);
+    const detail = payload?.detail;
+    const message =
+      typeof detail === "string"
+        ? detail
+        : Array.isArray(detail)
+          ? detail.map((item: { msg?: string }) => item?.msg || String(item)).join("; ")
+          : `Request failed: ${response.status}`;
+    throw new Error(message);
   }
 
   return (await response.json()) as T;
+}
+
+export async function apiUploadImages(
+  files: File[],
+  options?: { sku?: string },
+): Promise<{ images: string[]; count: number; errors?: Array<{ file?: string; error: string }> }> {
+  const form = new FormData();
+  form.append("sku", options?.sku || "item");
+  for (const file of files) {
+    form.append("files", file);
+  }
+  return apiRequest("/api/product-edits/upload-images", {
+    method: "POST",
+    body: form,
+  });
 }

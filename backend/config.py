@@ -60,3 +60,11 @@ def get_ozon_seller_ui_cookie() -> str:
 def ozon_cookie_configured() -> bool:
     return bool(get_ozon_cookie())
 
+
+def ozon_browser_enabled() -> bool:
+    return os.getenv("OZON_BROWSER_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+
+
+def ozon_browser_headless() -> bool:
+    return os.getenv("OZON_BROWSER_HEADLESS", "true").strip().lower() not in ("0", "false", "no", "off")
+
