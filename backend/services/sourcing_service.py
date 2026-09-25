@@ -67,13 +67,28 @@ def _find_display_attribute(attributes: dict[str, Any], aliases: tuple[str, ...]
 
 def _enrich_ozon_family_for_display(family: dict[str, Any]) -> dict[str, Any]:
     raw = family.get("raw_payload") or {}
+    if not isinstance(raw, dict):
+        raw = {}
     inner = raw.get("rawPayload") or {}
     details = inner.get("details") or raw.get("details") or {}
+    if not isinstance(details, dict):
+        details = {}
     variant = (family.get("variants") or [None])[0] or {}
     variant_attrs = variant.get("variant_attributes") or {}
-    attributes = dict(details.get("attributes") or variant_attrs or {})
+    attributes = dict(
+        details.get("attributes")
+        or raw.get("attributes")
+        or variant_attrs
+        or {}
+    )
 
-    images = details.get("images") or []
+    images = list(details.get("images") or raw.get("images") or [])
+    if not images and isinstance(family.get("bullet_points"), list):
+        images = [
+            str(url)
+            for url in (family.get("bullet_points") or [])
+            if isinstance(url, str) and url.startswith("http")
+        ]
     if not images and family.get("main_image_url"):
         images = [family.get("main_image_url")]
 
@@ -86,7 +101,7 @@ def _enrich_ozon_family_for_display(family: dict[str, Any]) -> dict[str, Any]:
         "title": family.get("title"),
         "brand": family.get("brand"),
         "source_url": family.get("source_url"),
-        "main_image_url": family.get("main_image_url"),
+        "main_image_url": family.get("main_image_url") or (images[0] if images else None),
         "rating": family.get("rating"),
         "review_count": family.get("review_count"),
         "category_name": category_name,
@@ -94,7 +109,9 @@ def _enrich_ozon_family_for_display(family: dict[str, Any]) -> dict[str, Any]:
         "type_id": family.get("type_id") or details.get("type_id"),
         "sales_rank": family.get("sales_rank"),
         "hot_score": family.get("hot_score"),
-        "price_text": _format_rub_price(variant.get("price_text") or details.get("price") or raw.get("price")),
+        "price_text": _format_rub_price(
+            variant.get("price_text") or raw.get("price_text") or details.get("price") or raw.get("price")
+        ),
         "description": (details.get("description") or "").strip(),
         "images": images,
         "size": size,

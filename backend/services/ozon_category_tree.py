@@ -150,3 +150,63 @@ def correct_category_id_for_type(
     if category_text != parent_text:
         return parent_text, type_text, True
     return category_text, type_text, False
+
+
+def _tokenize_query(text: str) -> list[str]:
+    import re
+
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return []
+    parts = re.findall(r"[\u4e00-\u9fff]{2,}|[a-zа-яё0-9]{2,}", raw, flags=re.I)
+    # 中文再切 2-gram，提高「宠物隧道」这类命中
+    grams: list[str] = []
+    for part in parts:
+        if re.fullmatch(r"[\u4e00-\u9fff]+", part) and len(part) >= 4:
+            for index in range(len(part) - 1):
+                grams.append(part[index : index + 2])
+        grams.append(part)
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in grams:
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out[:40]
+
+
+def search_types_by_query(query: str, *, limit: int = 12) -> list[dict[str, Any]]:
+    """按标题/关键词在官方类目树 type_name 里打分检索。"""
+    load_type_category_index(force=False)
+    if not _TYPE_TO_NAME:
+        load_type_category_index(force=True)
+    tokens = _tokenize_query(query)
+    if not tokens:
+        return []
+    query_norm = str(query or "").strip().lower()
+    scored: list[dict[str, Any]] = []
+    for type_id, type_name in _TYPE_TO_NAME.items():
+        name = str(type_name or "").strip()
+        if not name:
+            continue
+        name_l = name.lower()
+        score = 0
+        if query_norm and (query_norm in name_l or name_l in query_norm):
+            score += 100
+        for token in tokens:
+            if token in name_l:
+                score += 8 + min(len(token), 6)
+        if score <= 0:
+            continue
+        category_id = _TYPE_TO_CATEGORY.get(type_id)
+        scored.append(
+            {
+                "type_id": int(type_id),
+                "type_name": name,
+                "description_category_id": int(category_id) if category_id is not None else None,
+                "score": score,
+            }
+        )
+    scored.sort(key=lambda item: (-int(item["score"]), str(item["type_name"])))
+    return scored[: max(1, min(limit, 30))]

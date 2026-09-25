@@ -234,7 +234,7 @@ def test_build_import_items_per_variant_package_dimensions(monkeypatch):
         ("OZON-B", 330, 330, 330, 500),
         ("OZON-C", 420, 420, 420, 500),
     ]
-    assert items[0]["old_price"] == "64.8"
+    assert items[0]["old_price"] == "70.2"
     assert items[0]["price"] == "54"
 
 
@@ -265,14 +265,40 @@ def test_forced_package_metrics_override_all_variants(monkeypatch):
     assert all(i["depth"] == 100 and i["width"] == 100 and i["height"] == 100 and i["weight"] == 200 for i in items)
 
 
-def test_prefer_reachable_keeps_oss_gallery_with_variant_ozon_cover():
+def test_net_product_size_is_not_used_as_package(monkeypatch):
+    monkeypatch.setenv("OZON_FORCE_PACKAGE_METRICS", "false")
+    from services.ozon_listing_payload import read_net_product_mm, read_package_metrics
+
+    attrs = {
+        "depth_mm": "100",
+        "width_mm": "110",
+        "height_mm": "120",
+        "weight_g": "200",
+        "net_depth_mm": "300",
+        "net_width_mm": "40",
+        "net_height_mm": "20",
+        "Размеры товара, мм": "300*40*20",
+    }
+    assert read_package_metrics(attrs)[:3] == (100, 110, 120)
+    assert read_net_product_mm(attrs) == (300, 40, 20)
+    assert read_package_metrics(
+        {
+            "net_depth_mm": "300",
+            "net_width_mm": "40",
+            "net_height_mm": "20",
+            "Размеры товара, мм": "300*40*20",
+        }
+    )[0] is None
+
+
+def test_each_variant_listing_uses_own_images_only():
     from services.ozon_listing_payload import _prefer_reachable_listing_images, build_import_items
 
     oss = [f"https://bucket.aliyuncs.com/{i}.jpg" for i in range(1, 7)]
     ozon = "https://cdn1.ozone.ru/s3/multimedia-1/wc140/123.jpg"
-    result = _prefer_reachable_listing_images([ozon, *oss])
-    assert len(result) >= 6
-    assert all("aliyuncs.com" in u for u in result[:6])
+    result = _prefer_reachable_listing_images([*oss, ozon])
+    assert result[0] == oss[0]
+    assert "wc1200" in result[-1]
 
     edit = {
         "title": "嘴套",
@@ -291,21 +317,78 @@ def test_prefer_reachable_keeps_oss_gallery_with_variant_ozon_cover():
                 "sku": "OZON-S",
                 "price": 10,
                 "quantity": 99,
-                "image_url": "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-only.jpg",
-                "variant_attributes": {"Размер": "S"},
+                "image_url": "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-main.jpg",
+                "variant_attributes": {
+                    "Размер": "S",
+                    "images": [
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-main.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-2.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-3.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-4.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/s-5.jpg",
+                    ],
+                },
             },
             {
                 "sku": "OZON-L",
                 "price": 12,
                 "quantity": 99,
-                "image_url": "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-only.jpg",
-                "variant_attributes": {"Размер": "L"},
+                "image_url": "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-main.jpg",
+                "variant_attributes": {
+                    "Размер": "L",
+                    "images": [
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-main.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-2.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-3.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-4.jpg",
+                        "https://cdn1.ozone.ru/s3/multimedia-1/wc140/l-5.jpg",
+                    ],
+                },
             },
         ],
     }
     items = build_import_items(edit)
     assert len(items) == 2
-    assert len(items[0]["images"]) >= 5
-    assert len(items[1]["images"]) >= 5
-    # 两个尺码必须共用同一套完整图库（顺序可因主图置顶不同）
-    assert set(items[0]["images"]) == set(items[1]["images"])
+    assert "s-main" in items[0]["images"][0]
+    assert "l-main" in items[1]["images"][0]
+    assert all("s-" in url or "wc1200" in url for url in items[0]["images"])
+    assert all("l-" in url or "wc1200" in url for url in items[1]["images"])
+    assert oss[0] not in items[0]["images"]
+    assert oss[0] not in items[1]["images"]
+    assert items[0]["images"] != items[1]["images"]
+
+
+def test_product_centimeters_are_not_used_as_package_mm(monkeypatch):
+    monkeypatch.setenv("OZON_FORCE_PACKAGE_METRICS", "true")
+    edit = {
+        "title": "Тоннель 85 см",
+        "description": "d",
+        "images": ["https://example.com/1.jpg"],
+        "attributes": {
+            "description_category_id": "1",
+            "type_id": "2",
+            "package_manual": "1",
+            "depth_mm": "400",
+            "width_mm": "500",
+            "height_mm": "500",
+            "weight_g": "200",
+            "Длина рукава, см": "85",
+        },
+        "variants": [
+            {
+                "sku": "OZON-4246785373",
+                "price": 58,
+                "quantity": 99,
+                "title": "Тоннель-лежак 85 см, серый с тремя отверстиями и рожками",
+                "variant_attributes": {"袖长，厘米": "85"},
+            }
+        ],
+    }
+    items = build_import_items(edit)
+    # 400×500×500 mm 配 200g 过轻，回落到统一包裹，而不是标题里的 85 厘米
+    assert (items[0]["depth"], items[0]["width"], items[0]["height"], items[0]["weight"]) == (
+        100,
+        100,
+        100,
+        200,
+    )

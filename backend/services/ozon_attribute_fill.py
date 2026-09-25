@@ -11,6 +11,19 @@ def _norm(text: Any) -> str:
     return re.sub(r"\s+", "", str(text or "").strip().lower())
 
 
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+
+def contains_cjk(value: Any) -> bool:
+    return bool(_CJK_RE.search(str(value or "")))
+
+
+def strip_cjk(value: Any) -> str:
+    text = _CJK_RE.sub(" ", str(value or ""))
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" ,，、/;；")
+
+
 def _as_int(value: Any) -> int | None:
     try:
         number = int(str(value).strip())
@@ -315,6 +328,72 @@ def infer_color_label(*texts: Any) -> str | None:
     return None
 
 
+def listing_color_label(existing: Any, *hints: Any) -> str:
+    """推送到 Ozon 的颜色必须是俄语。汉字规格说明不能当颜色提交。"""
+    text = str(existing or "").strip()
+    junk = {"уточняйте у продавца", "ask seller", "зеленый", "зелёный", ""}
+    if text and not contains_cjk(text) and text.lower() not in junk:
+        return text
+    return infer_color_label(*hints) or ""
+
+
+_COLOR_GLUE = {"и", "а", "или"}
+
+
+def _title_words(title: str) -> list[str]:
+    return re.findall(r"[0-9A-Za-zА-Яа-яЁё-]+", str(title or ""))
+
+
+def variant_color_phrase(title: str, other_titles: list[str]) -> str:
+    """标题里其它变体没有的规格。例如「и рожками」收成「с рожками」。"""
+    mine = _title_words(title)
+    others: set[str] = set()
+    for item in other_titles:
+        others.update(word.lower() for word in _title_words(item))
+    extra_at = [
+        index
+        for index, word in enumerate(mine)
+        if word.lower() not in others and word.lower() not in _COLOR_GLUE
+    ]
+    if not extra_at:
+        return ""
+    start = extra_at[0]
+    extra_set = set(extra_at)
+    words: list[str] = []
+    index = start
+    while index < len(mine) and (index in extra_set or mine[index].lower() in _COLOR_GLUE):
+        if mine[index].lower() not in _COLOR_GLUE:
+            words.append(mine[index])
+        index += 1
+    phrase = " ".join(words).strip()
+    if phrase and start > 0 and mine[start - 1].lower() == "и":
+        phrase = f"с {phrase}"
+    return phrase
+
+
+def disambiguate_variant_colors(rows: list[tuple[str, str, str]]) -> dict[str, str]:
+    """同一张卡上颜色相同的变体，补上标题里独有的规格，否则 Ozon 拒绝合卡。"""
+    buckets: dict[str, list[tuple[str, str, str]]] = {}
+    for sku, color, title in rows:
+        buckets.setdefault(color.strip().lower(), []).append((sku, color.strip(), str(title or "")))
+    resolved: dict[str, str] = {}
+    for group in buckets.values():
+        if len(group) < 2:
+            sku, color, _title = group[0]
+            resolved[sku] = color
+            continue
+        used: set[str] = set()
+        for index, (sku, color, title) in enumerate(group):
+            others = [item_title for other_index, (_sku, _color, item_title) in enumerate(group) if other_index != index]
+            phrase = variant_color_phrase(title, others)
+            label = f"{color} {phrase}".strip() if phrase else color
+            if not label or label.lower() in used:
+                label = f"{label} {sku}".strip()
+            used.add(label.lower())
+            resolved[sku] = label
+    return resolved
+
+
 def _find_source_value(attr_name: str, source_map: dict[str, str]) -> str | None:
     target = _norm(attr_name)
     if not target:
@@ -370,6 +449,29 @@ def _find_source_value(attr_name: str, source_map: dict[str, str]) -> str | None
     return None
 
 
+def _listing_kit(current: Any, description: str) -> str:
+    """配套写成「物品 — 数量」清单。太短的「A, B」会拆开，不再只留两个词。"""
+    text = str(current or "").strip()
+    if text.count("\n") >= 2 or len(text) >= 80:
+        return text
+    parts = [part.strip(" .") for part in re.split(r"[,;，、]", text) if part.strip(" .")]
+    if len(parts) >= 2:
+        return "\n".join(f"{part} — 1 шт." for part in parts)
+    bullets: list[str] = []
+    for line in (description or "").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(("•", "-", "–")):
+            continue
+        item = stripped.lstrip("•-–").strip()
+        if item:
+            bullets.append(item)
+    if bullets:
+        return "\n".join(f"{item} — 1 шт." for item in bullets[:8])
+    if text:
+        return f"{text} — 1 шт."
+    return "Домик для животных — 1 шт."
+
+
 def _heuristic_attr_value(
     attr_name: str,
     *,
@@ -420,7 +522,7 @@ def _heuristic_attr_value(
         return "false"
     if "аннотац" in name:
         text = (description or edit_attributes.get("Аннотация") or edit_title or "").strip()
-        return text[:400] if text else None
+        return text[:5000] if text else None
     if "хештег" in name:
         tags = edit_attributes.get("search_keywords") or edit_attributes.get("#Хештеги")
         formatted = format_ozon_hashtags(tags if tags else edit_title)
@@ -440,7 +542,7 @@ def _heuristic_attr_value(
     if "упаковка" in name and "размер" not in name:
         return str(edit_attributes.get("Упаковка") or "Картонная коробка")
     if "комплектац" in name:
-        return str(edit_attributes.get("Комплектация") or "Домик для животных — 1 шт.")
+        return _listing_kit(edit_attributes.get("Комплектация"), description)
     if "особенност" in name:
         return str(
             edit_attributes.get("Особенности конструкции")
@@ -478,12 +580,17 @@ def _build_source_map(edit_attributes: dict[str, Any]) -> dict[str, str]:
         "search_keywords",
         "currency_code",
         "ozon_auto_attributes",
+        "listing_notes",
+        "last_heal_errors",
+        "heal_attempts",
+        "package_manual",
+        "variant_aspect",
     }
     for key, value in (edit_attributes or {}).items():
         if key in skip_keys or value is None:
             continue
         text = str(value).strip()
-        if not text:
+        if not text or contains_cjk(text):
             continue
         source[_norm(key)] = text
     return source
@@ -555,12 +662,25 @@ def _normalize_attr_value_for_type(attr_type: str, value: Any) -> str:
         try:
             return str(int(float(str(value).replace(",", "."))))
         except (TypeError, ValueError):
+            match = re.search(r"(\d+(?:[.,]\d+)?)", str(value))
+            if match:
+                try:
+                    return str(int(float(match.group(1).replace(",", "."))))
+                except ValueError:
+                    pass
             return str(value).strip()
     if t in {"decimal", "float", "number"}:
         try:
             num = float(str(value).replace(",", "."))
             return str(int(num)) if num.is_integer() else str(num)
         except (TypeError, ValueError):
+            match = re.search(r"(\d+(?:[.,]\d+)?)", str(value))
+            if match:
+                try:
+                    num = float(match.group(1).replace(",", "."))
+                    return str(int(num)) if num.is_integer() else str(num)
+                except ValueError:
+                    pass
             return str(value).strip()
     if isinstance(value, bool):
         return "true" if value else "false"
@@ -575,7 +695,10 @@ def _coerce_filled_value(attr: dict[str, Any], value: Any) -> str:
     name = str(attr.get("name") or attr.get("description") or "")
     if "хештег" in _norm(name):
         return format_ozon_hashtags(value)
-    return _normalize_attr_value_for_type(attr_type, value)
+    text = _normalize_attr_value_for_type(attr_type, value)
+    if contains_cjk(text):
+        text = strip_cjk(text)
+    return text
 
 
 def format_missing_attribute_labels(items: list[dict[str, Any]]) -> str:
@@ -687,6 +810,15 @@ def build_ozon_attribute_values(
                 description=description,
             )
         name_norm = _norm(name)
+        if "аннотац" in name_norm:
+            rich = str(description or "").strip()
+            if rich:
+                source_value = rich[:5000]
+        elif "комплектац" in name_norm:
+            source_value = _listing_kit(source_value, description)
+        if source_value and contains_cjk(source_value):
+            cleaned = strip_cjk(source_value)
+            source_value = cleaned or None
         is_model_attr = any(k in name_norm for k in ("модел", "model", "型号", "названиемодели"))
 
         # 非必填且无来源/启发式：跳过
@@ -770,7 +902,20 @@ def build_ozon_attribute_values(
 
 _VARIANT_ASPECT_ALIASES = (
     ("цвет", ("цвет", "color", "颜色", "colour")),
-    ("размер", ("размер", "size", "尺码", "разм", "габарит", "упаков")),
+    (
+        "размер",
+        (
+            "размер",
+            "size",
+            "尺码",
+            "разм",
+            "габарит",
+            "рукав",
+            "sleeve",
+            "袖长",
+            "袖",
+        ),
+    ),
     ("вес", ("вес", "weight", "重量", "масса")),
     ("память", ("память", "memory", "storage", "объем", "объём", "gb", "容量")),
     ("вкус", ("вкус", "flavor", "味")),
@@ -780,10 +925,58 @@ _VARIANT_ASPECT_ALIASES = (
 
 def is_variant_aspect_attr_name(name: str) -> bool:
     norm = _norm(name)
+    # 包装尺寸不是合卡可变特性，避免误覆盖
+    if "упаков" in norm:
+        return False
     for _canonical, keys in _VARIANT_ASPECT_ALIASES:
         if any(k in norm for k in keys):
             return True
     return False
+
+
+def _is_color_aspect_name(name: str) -> bool:
+    return any(token in _norm(name) for token in ("цвет", "color", "颜色", "colour"))
+
+
+def _is_size_aspect_name(name: str) -> bool:
+    if _is_color_aspect_name(name):
+        return False
+    norm = _norm(name)
+    if "упаков" in norm:
+        return False
+    return any(
+        token in norm
+        for token in ("размер", "size", "尺码", "рукав", "sleeve", "袖", "габарит")
+    ) or ("длина" in norm and "рукав" in norm)
+
+
+def _aspect_source_from_overrides(attr_name: str, overrides: dict[str, str]) -> str | None:
+    """按属性名从变体 overrides 取值。袖长类优先匹配 袖长/рукав，其次 Размер。"""
+    mapped = {_norm(k): v for k, v in overrides.items()}
+    source = _find_source_value(attr_name, mapped)
+    if source:
+        return source
+    name_norm = _norm(attr_name)
+    preferred_keys: tuple[str, ...]
+    if any(token in name_norm for token in ("рукав", "sleeve", "袖")):
+        preferred_keys = ("袖长", "рукав", "sleeve", "размер", "size", "尺码")
+    elif _is_size_aspect_name(attr_name):
+        preferred_keys = ("размер", "size", "尺码", "袖长", "рукав", "sleeve")
+    elif _is_color_aspect_name(attr_name):
+        preferred_keys = ("цвет", "color", "颜色", "названиецвета")
+    else:
+        preferred_keys = ()
+    for key, value in overrides.items():
+        key_norm = _norm(key)
+        if any(token in key_norm for token in preferred_keys):
+            return value
+    for key, value in overrides.items():
+        if is_variant_aspect_attr_name(key) and (
+            any(part in name_norm for part in _norm(key).split() if len(part) > 2)
+            or any(part in key_norm for part in name_norm.split() if len(part) > 2)
+        ):
+            return value
+    return None
 
 
 def apply_variant_distinguishing_attributes(
@@ -793,23 +986,25 @@ def apply_variant_distinguishing_attributes(
     type_id: int,
     variant_attributes: dict[str, Any] | None,
     edit_title: str = "",
+    variant_aspect: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     在共享属性基础上，按变体规格覆盖颜色/尺码等区分属性。
     型号名等合卡字段保持与 base 一致。
+    variant_aspect=size 时去掉颜色可变特性；=color 时按颜色覆盖。
     """
+    aspect_mode = str(variant_aspect or "color").strip().lower()
+    if aspect_mode not in {"color", "size"}:
+        aspect_mode = "color"
     overrides = {
         str(k).strip(): str(v).strip()
         for k, v in (variant_attributes or {}).items()
         if str(k).strip() and str(v).strip()
     }
-    if not overrides:
-        return [dict(item) for item in base_attributes]
 
     try:
         schema = fetch_category_attributes(description_category_id, type_id)
     except OzonSellerError:
-        # 拉不到 schema 时，尽量以文本形式追加（若 id 已知则跳过）
         return [dict(item) for item in base_attributes]
 
     client = OzonSellerClient()
@@ -819,29 +1014,41 @@ def apply_variant_distinguishing_attributes(
         for index, item in enumerate(result)
         if _as_int(item.get("id")) is not None
     }
+    drop_ids: set[int] = set()
 
     for attr in schema:
         attr_id = _as_int(attr.get("id") or attr.get("attribute_id"))
         if attr_id is None:
             continue
         name = str(attr.get("name") or attr.get("description") or "")
-        if not is_variant_aspect_attr_name(name):
+        is_aspect = bool(attr.get("is_aspect"))
+        if not is_aspect and not is_variant_aspect_attr_name(name):
             continue
         # 型号用于合卡，不能按变体改
         if any(k in _norm(name) for k in ("модел", "model", "型号", "названиемодели")):
             continue
+        # 包装尺寸不是可变特性
+        if "упаков" in _norm(name):
+            continue
 
-        source_value = _find_source_value(name, {_norm(k): v for k, v in overrides.items()})
+        is_color = _is_color_aspect_name(name)
+        if aspect_mode == "size" and is_color:
+            drop_ids.add(attr_id)
+            continue
+        if aspect_mode == "color" and _is_size_aspect_name(name) and not overrides:
+            continue
+
+        if not overrides:
+            continue
+        source_value = _aspect_source_from_overrides(name, overrides)
         if not source_value:
-            # 直接按别名从 overrides 找
-            for key, value in overrides.items():
-                if is_variant_aspect_attr_name(key) and (
-                    any(a in _norm(name) for a in _norm(key).split())
-                    or any(a in _norm(key) for a in _norm(name).split() if len(a) > 2)
-                ):
-                    source_value = value
-                    break
-        if not source_value:
+            continue
+        if contains_cjk(source_value):
+            if is_color:
+                source_value = infer_color_label(edit_title) or ""
+            else:
+                source_value = strip_cjk(source_value)
+        if not source_value or contains_cjk(source_value):
             continue
 
         dictionary_id = attr.get("dictionary_id")
@@ -869,4 +1076,6 @@ def apply_variant_distinguishing_attributes(
             by_id[attr_id] = len(result)
             result.append(entry)
 
+    if drop_ids:
+        result = [item for item in result if _as_int(item.get("id")) not in drop_ids]
     return result

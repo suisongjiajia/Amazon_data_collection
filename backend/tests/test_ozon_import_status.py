@@ -66,18 +66,41 @@ def test_resolve_publish_item_status_sellable():
     assert status == "listed"
     assert code is None
 
-    status2, code2, _msg2 = resolve_publish_item_status(
+    status2, code2, msg2 = resolve_publish_item_status(
         import_raw_status="imported",
         import_errors=[],
         product_info={
+            "id": 11,
             "sku": 5646903305,
-            "statuses": {"is_created": True, "status_name": "不出售"},
+            "statuses": {"is_created": True, "status": "disabled", "status_name": "不出售"},
             "visibility_details": {"has_stock": False},
             "stocks": {"has_stock": False},
         },
     )
-    assert status2 == "pushed"
-    assert code2 == "NOT_SELLABLE_YET"
+    assert status2 == "paused"
+    assert code2 == "SELLER_PAUSED"
+
+    status3, code3, _msg3 = resolve_publish_item_status(
+        import_raw_status="imported",
+        import_errors=[],
+        product_info={
+            "id": 6395553506,
+            "sku": 0,
+            "is_archived": False,
+            "barcodes": [],
+            "statuses": {
+                "status": "offer_validated",
+                "is_created": False,
+                "status_name": "Не продается",
+                "status_description": "Создается",
+            },
+            "visibility_details": {"has_price": True, "has_stock": False},
+            "stocks": {"has_stock": False, "stocks": []},
+        },
+    )
+    assert status3 == "pushed"
+    assert code3 == "NOT_SELLABLE_YET"
+    assert "停售" in (msg2 or "")
 
 
 def test_is_ozon_product_sellable():

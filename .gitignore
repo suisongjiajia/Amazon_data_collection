@@ -27,6 +27,11 @@ frontend/dist/
 logs/
 *.log
 
+### Temp / local debug outputs ###
+tmp_*.json
+tmp_*.png
+tmp_*.jpg
+
 ### Ozon browser profile / diag ###
 .ozon-chrome-profile/
 .ozon-browser-profile/

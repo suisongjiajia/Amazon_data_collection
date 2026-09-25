@@ -15,6 +15,7 @@ export interface OzonViewDefinition {
 export interface OzonCollectionTask {
   id: number;
   task_no: string;
+  platform?: string | null;
   strategy_type: string;
   strategy_params?: Record<string, unknown> | null;
   source_url?: string | null;
@@ -29,6 +30,7 @@ export interface OzonCollectionTask {
 
 export interface OzonProductFamily {
   id: number;
+  platform?: string | null;
   external_id?: string | null;
   title?: string | null;
   brand?: string | null;
@@ -192,6 +194,7 @@ export interface ProductEdit {
   family_title?: string | null;
   family_main_image_url?: string | null;
   family_external_id?: string | null;
+  family_source_url?: string | null;
   category_name?: string | null;
   sales_rank?: number | null;
   variants: ProductEditVariant[];
@@ -204,7 +207,7 @@ export interface ProductEditVariant {
   price?: number | null;
   quantity: number;
   image_url?: string | null;
-  variant_attributes?: Record<string, string> | null;
+  variant_attributes?: Record<string, unknown> | null;
 }
 
 export interface OzonPublishTask {

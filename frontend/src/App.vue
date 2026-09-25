@@ -5,7 +5,6 @@ import OzonCollectView from "./components/OzonCollectView.vue";
 import OzonPublishView from "./components/OzonPublishView.vue";
 import ProductEditView from "./components/ProductEditView.vue";
 import ReviewView from "./components/ReviewView.vue";
-import ShopPipelineView from "./components/ShopPipelineView.vue";
 import SourcingView from "./components/SourcingView.vue";
 import ErpLayout from "./components/erp/ErpLayout.vue";
 import { useAppStore } from "./composables/useAppStore";
@@ -28,8 +27,10 @@ onMounted(() => {
     @update:module="store.setModule"
     @refresh="store.refreshAll"
   >
-    <OzonCollectView v-if="store.activeModule.value === 'ozon-collect'" />
-    <ShopPipelineView v-else-if="store.activeModule.value === 'shop-pipeline'" />
+    <OzonCollectView
+      v-if="store.activeModule.value === 'ozon-collect' || store.activeModule.value === 'shop-pipeline'"
+      :initial-panel="store.activeModule.value === 'shop-pipeline' ? 'pipeline' : 'collect'"
+    />
     <SourcingView v-else-if="store.activeModule.value === 'sourcing'" />
     <ProductEditView v-else-if="store.activeModule.value === 'product-edit'" />
     <ReviewView v-else-if="store.activeModule.value === 'review'" />

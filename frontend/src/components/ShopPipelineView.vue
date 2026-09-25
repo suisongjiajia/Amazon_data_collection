@@ -13,8 +13,15 @@ import ErpPageHeader from "./erp/ErpPageHeader.vue";
 import ErpProductCell from "./erp/ErpProductCell.vue";
 import ErpStatGrid from "./erp/ErpStatGrid.vue";
 
+const props = withDefaults(
+  defineProps<{
+    embedded?: boolean;
+  }>(),
+  { embedded: false },
+);
+
 const store = useAppStore();
-const module = getModuleDefinition("shop-pipeline");
+const module = getModuleDefinition("ozon-collect");
 const shopUrl = ref("");
 const topN = ref(50);
 const starting = ref(false);
@@ -23,6 +30,7 @@ const selectedJobId = ref<number | null>(null);
 const selectedJob = ref<ShopPipelineJob | null>(null);
 const loadingJobs = ref(false);
 const retrying = ref(false);
+const deletingId = ref<number | null>(null);
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
 const FAIL_STATUSES = new Set([
@@ -81,18 +89,32 @@ async function openJob(jobId: number, showLoading = true): Promise<void> {
 async function startPipeline(): Promise<void> {
   const url = shopUrl.value.trim();
   if (!url) {
-    store.showError("请粘贴 Ozon 店铺链接");
+    store.showError("请粘贴 Ozon 或 1688 店铺链接");
     return;
   }
   if (starting.value) return;
   starting.value = true;
-  store.showNotice("已启动店铺流水线（后台采集 + 批量处理）…");
+  const is1688 = /1688\.com|alibaba\.com/i.test(url);
+  store.showNotice(
+    is1688
+      ? "已启动 1688 整店采集（调试 Chrome / CDP）…"
+      : "已启动店铺流水线（后台采集 + 批量处理）…",
+  );
   try {
-    const job = await apiRequest<ShopPipelineJob>("/api/shop-pipeline/start", {
+    const result = await apiRequest<Record<string, unknown>>("/api/shop-pipeline/start", {
       method: "POST",
       body: JSON.stringify({ shop_url: url, top_n: topN.value || 50 }),
     });
     shopUrl.value = "";
+    if (is1688 || result.families || result.count != null) {
+      const count = Number(result.count ?? (Array.isArray(result.families) ? result.families.length : 0));
+      store.showNotice(
+        String(result.message || `1688 店铺已采集 ${count} 个商品（后续再接类目与上架）`),
+      );
+      await store.refreshAll();
+      return;
+    }
+    const job = result as unknown as ShopPipelineJob;
     selectedJobId.value = job.id;
     selectedJob.value = job;
     store.showNotice(`流水线已创建：${job.job_no}`);
@@ -136,6 +158,21 @@ async function retryItem(itemId: number): Promise<void> {
   }
 }
 
+async function deleteItem(itemId: number): Promise<void> {
+  if (deletingId.value != null) return;
+  deletingId.value = itemId;
+  try {
+    await apiRequest(`/api/shop-pipeline/items/${itemId}`, { method: "DELETE" });
+    store.showNotice("已从任务中删除");
+    if (selectedJobId.value != null) await openJob(selectedJobId.value);
+    await refreshJobs();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    deletingId.value = null;
+  }
+}
+
 onMounted(() => {
   void refreshJobs();
   pollTimer = setInterval(() => {
@@ -152,7 +189,11 @@ onUnmounted(() => {
 
 <template>
   <div class="erp-stack">
-    <ErpPageHeader :title="module.label" :description="module.description" />
+    <ErpPageHeader
+      v-if="!props.embedded"
+      :title="module.label"
+      description="店铺流行 Top50 → 搜货选供 → AI Listing → 进入审核"
+    />
 
     <ErpStatGrid
       :items="[
@@ -165,7 +206,7 @@ onUnmounted(() => {
 
     <ErpCard
       title="启动店铺流水线"
-      description="粘贴卖家店铺链接 → 采集流行 Top N → 批量搜货/选供/AI/Listing → 进入审核"
+      description="Ozon 店铺：采集→搜货→AI→审核。1688 店铺：采集后自动匹配类目/AI/进审核"
     >
       <div class="erp-form-row">
         <label class="erp-field erp-field--grow">
@@ -173,7 +214,7 @@ onUnmounted(() => {
           <input
             v-model="shopUrl"
             type="text"
-            placeholder="https://www.ozon.ru/seller/xxx/"
+            placeholder="Ozon /seller/... 或 1688 店铺 https://shopXXXX.1688.com/"
             @keyup.enter="startPipeline"
           />
         </label>
@@ -263,17 +304,25 @@ onUnmounted(() => {
                 </td>
                 <td><ErpBadge :status="item.status" /></td>
                 <td>
-                  <ErpButton
-                    v-if="isFailStatus(item.status)"
-                    size="sm"
-                    variant="secondary"
-                    :disabled="retrying"
-                    @click="retryItem(item.id)"
-                  >
-                    重试
-                  </ErpButton>
-                  <span v-else-if="item.edit_id" class="muted">edit #{{ item.edit_id }}</span>
-                  <span v-else class="muted">-</span>
+                  <div class="item-actions">
+                    <ErpButton
+                      v-if="isFailStatus(item.status)"
+                      size="sm"
+                      variant="secondary"
+                      :disabled="retrying || deletingId != null"
+                      @click="retryItem(item.id)"
+                    >
+                      重试
+                    </ErpButton>
+                    <ErpButton
+                      size="sm"
+                      variant="ghost"
+                      :disabled="deletingId != null"
+                      @click="deleteItem(item.id)"
+                    >
+                      {{ deletingId === item.id ? "删除中…" : "删除" }}
+                    </ErpButton>
+                  </div>
                 </td>
               </tr>
             </tbody>
@@ -306,9 +355,20 @@ onUnmounted(() => {
 }
 
 .item-error {
-  margin: 4px 0 0;
+  margin: 6px 0 0;
   color: #b42318;
   font-size: 12px;
+  line-height: 1.45;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.item-actions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
 }
 
 .erp-table tr.is-clickable {

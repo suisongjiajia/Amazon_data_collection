@@ -158,21 +158,42 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
     from services.ozon_category_resolve_service import resolve_category_for_family
     from services.ozon_pricing_service import DEFAULT_STOCK_QTY, suggest_price_for_family
 
-    # 创建编辑前尽量自动补全类目/类型，避免手填
+    family = get_ozon_product_family(raw_product_family_id)
+    is_1688 = str(family.get("platform") or "") == "1688"
+
+    # 创建编辑前尽量自动补全类目/类型；1688 走标题匹配，Ozon 走 resolve/by-sku
     try:
-        resolve_category_for_family(raw_product_family_id, force=False)
+        if is_1688:
+            from services.ozon_category_match_service import match_category_for_family
+
+            match_category_for_family(raw_product_family_id, force=False)
+            family = get_ozon_product_family(raw_product_family_id)
+        else:
+            resolve_category_for_family(raw_product_family_id, force=False)
+            family = get_ozon_product_family(raw_product_family_id)
     except Exception:
         pass
 
-    family = get_ozon_product_family(raw_product_family_id)
     raw = family.get("raw_payload") or {}
+    if not isinstance(raw, dict):
+        raw = {}
     inner = raw.get("rawPayload") or {}
+    if not isinstance(inner, dict):
+        inner = {}
     details = inner.get("details") or raw.get("details") or {}
-    images = list(details.get("images") or [])
+    if not isinstance(details, dict):
+        details = {}
+    images = list(details.get("images") or raw.get("images") or [])
+    if isinstance(family.get("bullet_points"), list):
+        for url in family.get("bullet_points") or []:
+            if isinstance(url, str) and url.startswith("http") and url not in images:
+                images.append(url)
     if not images and family.get("main_image_url"):
         images = [family.get("main_image_url")]
 
-    attributes: dict[str, Any] = dict(details.get("attributes") or {})
+    attributes: dict[str, Any] = dict(details.get("attributes") or raw.get("attributes") or {})
+    # 列表/编辑属性不塞整张包装表（体积大，易撑爆 MySQL sort buffer）
+    attributes.pop("pack_rows", None)
     description_category_id = (
         family.get("category_id")
         or details.get("description_category_id")
@@ -189,17 +210,79 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
         attributes.setdefault("weight", details["weight"])
     attributes.setdefault("brand_mode", "no_brand")
     attributes.setdefault("fulfillment", "rFBS")
-    # 全站统一包裹：100×100×100 mm / 200g
+    if is_1688:
+        attributes.setdefault("source_platform", "1688")
+        # 双区分项：采集时 color 已合成「款式 · 尺码」，合卡按颜色轴区分
+        family_variants = family.get("variants") or []
+        has_distinguished = any(
+            str(v.get("color") or (v.get("variant_attributes") or {}).get("区分项") or "").strip()
+            for v in family_variants
+        )
+        if has_distinguished:
+            attributes.setdefault("variant_aspect", "color")
+        # 1688：优先用详情页包装尺寸/重量，避免被统一默认 100×100×100/200g 覆盖
+        from collector.alibaba1688.package_parse import extract_package_metrics
+        from services.ozon_listing_payload import package_is_manual
+
+        detail_blob = {}
+        nested_raw = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+        if isinstance(nested_raw.get("detail"), dict):
+            detail_blob = nested_raw["detail"]
+        elif isinstance(raw.get("detail"), dict):
+            detail_blob = raw["detail"]
+        package_metrics = {}
+        if isinstance(nested_raw.get("package_metrics"), dict):
+            package_metrics = nested_raw["package_metrics"]
+        elif isinstance(raw.get("package_metrics"), dict):
+            package_metrics = raw["package_metrics"]
+        if not package_metrics:
+            package_metrics = extract_package_metrics(attributes=attributes, detail=detail_blob)
+        if package_metrics.get("depth_mm") and package_metrics.get("width_mm") and package_metrics.get("height_mm"):
+            d, w, h = (
+                int(package_metrics["depth_mm"]),
+                int(package_metrics["width_mm"]),
+                int(package_metrics["height_mm"]),
+            )
+            attributes["Длина, мм"] = str(d)
+            attributes["Ширина, мм"] = str(w)
+            attributes["Высота, мм"] = str(h)
+            attributes["depth_mm"] = str(d)
+            attributes["width_mm"] = str(w)
+            attributes["height_mm"] = str(h)
+            attributes["length_mm"] = str(d)
+            attributes["Размеры, мм"] = f"{d}*{w}*{h}"
+            attributes["Размер упаковки (Длина х Ширина х Высота), см"] = (
+                f"{max(1, round(d / 10))}x{max(1, round(w / 10))}x{max(1, round(h / 10))}"
+            )
+        if package_metrics.get("weight_g"):
+            wg = int(package_metrics["weight_g"])
+            attributes["Вес, г"] = str(wg)
+            attributes["Вес товара, г"] = str(wg)
+            attributes["Вес с упаковкой, г"] = str(wg)
+            attributes["weight_g"] = str(wg)
+            attributes["weight"] = str(wg)
+        if package_metrics and not package_is_manual(attributes):
+            attributes["package_manual"] = "1"
+            attributes["package_source"] = "1688_detail"
+    # 全站统一包裹：100×100×100 mm / 200g（手改 / 1688 详情已写入则跳过）
     from services.ozon_listing_payload import apply_fixed_package_attributes
 
     attributes = apply_fixed_package_attributes(attributes)
 
     initial_qty = DEFAULT_STOCK_QTY
     initial_price = None
+    scaled_prices: list[int] = []
     try:
         priced = suggest_price_for_family(raw_product_family_id)
         initial_price = priced["pricing"]["list_price"]
         initial_qty = priced["pricing"]["stock_qty"]
+        from services.ozon_pricing_service import variant_prices_from_collected
+
+        scaled_prices = variant_prices_from_collected(
+            int(initial_price),
+            list(family.get("variants") or []),
+            anchor_external_id=str(family.get("external_id") or ""),
+        )
         attributes["pricing_formula"] = priced["pricing"]["formula"]
         attributes["currency_code"] = priced["pricing"]["currency_code"]
         attributes["freight_channel"] = priced["freight"]["channel_name"]
@@ -208,6 +291,7 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
         attributes["pricing_error"] = str(exc)
 
     description = (details.get("description") or "").strip()
+    sku_prefix = "A1688-" if is_1688 else "OZON-"
 
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -248,8 +332,24 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
             edit_id = int(cursor.fetchone()[0])
 
             kept_skus: list[str] = []
-            for variant in family.get("variants") or []:
-                sku = f"OZON-{variant.get('external_id') or variant['id']}"
+            for index, variant in enumerate(family.get("variants") or []):
+                sku = f"{sku_prefix}{variant.get('external_id') or variant['id']}"
+                variant_price = scaled_prices[index] if index < len(scaled_prices) else initial_price
+                va = dict(variant.get("variant_attributes") or {})
+                # 每个变体独立 listing：确保有完整主图+副图
+                own = va.get("images")
+                if not isinstance(own, list) or not own:
+                    built: list[str] = []
+                    primary = str(variant.get("main_image_url") or "").strip()
+                    if primary:
+                        built.append(primary)
+                    for url in images:
+                        text = str(url or "").strip()
+                        if text and text not in built:
+                            built.append(text)
+                    va["images"] = built[:15]
+                    if built:
+                        va["image_url"] = built[0]
                 cursor.execute(
                     """
                     INSERT INTO product_edit_variant (
@@ -264,9 +364,9 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                     ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     ON DUPLICATE KEY UPDATE
                         title = COALESCE(VALUES(title), title),
-                        price = COALESCE(VALUES(price), price),
+                        price = VALUES(price),
                         quantity = VALUES(quantity),
-                        image_url = COALESCE(VALUES(image_url), image_url),
+                        image_url = VALUES(image_url),
                         variant_attributes = COALESCE(VALUES(variant_attributes), variant_attributes),
                         raw_product_variant_id = VALUES(raw_product_variant_id),
                         updated_at = CURRENT_TIMESTAMP
@@ -276,10 +376,10 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                         variant["id"],
                         sku,
                         variant.get("title"),
-                        initial_price,
+                        variant_price,
                         initial_qty,
-                        variant.get("main_image_url"),
-                        to_json(variant.get("variant_attributes") or {}),
+                        variant.get("main_image_url") or (va.get("images") or [None])[0],
+                        to_json(va),
                     ),
                 )
                 kept_skus.append(sku)
@@ -306,7 +406,8 @@ def get_product_edit(edit_id: int) -> dict[str, Any]:
     record = fetch_one(
         """
         SELECT pe.*, rf.title AS family_title, rf.main_image_url AS family_main_image_url,
-               rf.sales_rank, rf.category_name, rf.external_id AS family_external_id
+               rf.sales_rank, rf.category_name, rf.external_id AS family_external_id,
+               rf.source_url AS family_source_url
         FROM product_edit pe
         JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
         WHERE pe.id = %s
@@ -319,32 +420,65 @@ def get_product_edit(edit_id: int) -> dict[str, Any]:
 
 
 def list_product_edits(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """列表查询：先按 id 轻量排序，再取详情，避免 pe.* + ORDER BY 撑爆 MySQL sort buffer。"""
+    limit = max(1, min(int(limit), 200))
     if status:
-        edits = fetch_all(
+        id_rows = fetch_all(
             """
-            SELECT pe.*, rf.title AS family_title, rf.main_image_url AS family_main_image_url,
-                   rf.sales_rank, rf.category_name, rf.external_id AS family_external_id
+            SELECT pe.id
             FROM product_edit pe
-            JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
             WHERE pe.status = %s
-            ORDER BY pe.updated_at DESC
+            ORDER BY pe.updated_at DESC, pe.id DESC
             LIMIT %s
             """,
             (status, limit),
         )
     else:
-        edits = fetch_all(
+        id_rows = fetch_all(
             """
-            SELECT pe.*, rf.title AS family_title, rf.main_image_url AS family_main_image_url,
-                   rf.sales_rank, rf.category_name, rf.external_id AS family_external_id
+            SELECT pe.id
             FROM product_edit pe
-            JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
-            ORDER BY pe.updated_at DESC
+            ORDER BY pe.updated_at DESC, pe.id DESC
             LIMIT %s
             """,
             (limit,),
         )
-    return [_attach_edit_variants(edit) for edit in edits]
+    edit_ids = [int(row["id"]) for row in id_rows if row.get("id") is not None]
+    if not edit_ids:
+        return []
+
+    placeholders = ", ".join(["%s"] * len(edit_ids))
+    # 列表不取 listing_payload（体积大且列表页不用）
+    edits = fetch_all(
+        f"""
+        SELECT
+            pe.id,
+            pe.raw_product_family_id,
+            pe.title,
+            pe.description,
+            pe.bullet_points,
+            pe.images,
+            pe.attributes,
+            pe.status,
+            pe.target_platform,
+            pe.listing_built_at,
+            pe.created_at,
+            pe.updated_at,
+            rf.title AS family_title,
+            rf.main_image_url AS family_main_image_url,
+            rf.sales_rank,
+            rf.category_name,
+            rf.external_id AS family_external_id,
+            rf.source_url AS family_source_url
+        FROM product_edit pe
+        JOIN raw_product_family rf ON rf.id = pe.raw_product_family_id
+        WHERE pe.id IN ({placeholders})
+        """,
+        tuple(edit_ids),
+    )
+    by_id = {int(edit["id"]): edit for edit in edits}
+    ordered = [by_id[edit_id] for edit_id in edit_ids if edit_id in by_id]
+    return [_attach_edit_variants(edit) for edit in ordered]
 
 
 def update_product_edit(
@@ -509,8 +643,15 @@ def create_review_record(
     auto_reviewed: bool = False,
 ) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
-    if edit["status"] != "pending_review":
-        raise ValueError("仅待审核 Listing 可审批")
+    status = str(edit.get("status") or "")
+    if result == "approved":
+        if status != "pending_review":
+            raise ValueError("仅待审核 Listing 可审批通过（待修复请先改完再提交审核）")
+    elif result == "rejected":
+        if status not in {"pending_review", "needs_fix"}:
+            raise ValueError("仅待审核或待修复 Listing 可驳回")
+    else:
+        raise ValueError(f"未知审核结果：{result}")
     new_status = "approved" if result == "approved" else "rejected"
     with get_connection() as connection:
         with connection.cursor() as cursor:

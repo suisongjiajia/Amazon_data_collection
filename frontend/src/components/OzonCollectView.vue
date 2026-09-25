@@ -5,6 +5,7 @@ import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
 import type { OzonCollectionTask, OzonProductFamily } from "../types/ozon-workflow";
+import ShopPipelineView from "./ShopPipelineView.vue";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -13,19 +14,37 @@ import ErpPageHeader from "./erp/ErpPageHeader.vue";
 import ErpProductCell from "./erp/ErpProductCell.vue";
 import ErpStatGrid from "./erp/ErpStatGrid.vue";
 
+const props = withDefaults(
+  defineProps<{
+    initialPanel?: "collect" | "pipeline";
+  }>(),
+  { initialPanel: "collect" },
+);
+
 const store = useAppStore();
 const module = getModuleDefinition("ozon-collect");
+const panel = ref<"collect" | "pipeline">(props.initialPanel);
 const collectionUrl = ref("");
 const collecting = ref(false);
 const retryingTaskId = ref<number | null>(null);
 const pipelineTaskId = ref<number | null>(null);
 
-function productCollectUrl(item: Pick<OzonProductFamily, "source_url" | "external_id">): string | null {
+function productCollectUrl(item: Pick<OzonProductFamily, "source_url" | "external_id" | "platform">): string | null {
   const direct = item.source_url?.trim();
   if (direct) return direct;
   const externalId = item.external_id?.trim();
-  if (externalId) return `https://www.ozon.ru/product/${externalId}/`;
-  return null;
+  if (!externalId) return null;
+  if (item.platform === "1688") return `https://detail.1688.com/offer/${externalId}.html`;
+  return `https://www.ozon.ru/product/${externalId}/`;
+}
+
+function rowPrice(item: OzonProductFamily): string {
+  const sku = item.external_id?.trim();
+  const variants = item.variants || [];
+  const own = sku ? variants.find((variant) => variant.external_id === sku) : undefined;
+  const fromVariant = own?.price_text || variants.find((variant) => variant.price_text)?.price_text;
+  if (fromVariant) return fromVariant;
+  return item.price_text || "-";
 }
 
 function truncateUrl(value: string, maxLength = 48): string {
@@ -57,18 +76,27 @@ const failedTaskCount = computed(
 async function submitCollection(): Promise<void> {
   const url = collectionUrl.value.trim();
   if (!url) {
-    store.showError("请先输入 Ozon 链接");
+    store.showError("请先输入 Ozon 或 1688 链接");
     return;
   }
   if (collecting.value) return;
   collecting.value = true;
-  store.showNotice("正在采集，请稍候…");
+  const is1688Shop = /1688\.com|alibaba\.com/i.test(url) && !/\/offer\//i.test(url);
+  store.showNotice(is1688Shop ? "正在采集 1688 店铺，请稍候…" : "正在采集，请稍候…");
   try {
-    await apiRequest("/api/ozon/collect", {
-      method: "POST",
-      body: JSON.stringify({ url }),
-    });
-    store.showNotice("采集完成");
+    if (is1688Shop) {
+      const result = await apiRequest<{ count?: number; message?: string }>("/api/1688/shop-collect", {
+        method: "POST",
+        body: JSON.stringify({ shop_url: url, top_n: 50 }),
+      });
+      store.showNotice(result.message || `1688 店铺已采集 ${result.count ?? 0} 个商品`);
+    } else {
+      await apiRequest("/api/ozon/collect", {
+        method: "POST",
+        body: JSON.stringify({ url }),
+      });
+      store.showNotice("采集完成");
+    }
     collectionUrl.value = "";
     await store.refreshAll();
   } catch (err) {
@@ -106,7 +134,12 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
   }
   if (pipelineTaskId.value != null || collecting.value) return;
   pipelineTaskId.value = task.id;
-  store.showNotice("正在用已采商品启动流水线（不再重采）…");
+  const is1688 = String(task.platform || "").toLowerCase() === "1688";
+  store.showNotice(
+    is1688
+      ? "正在启动 1688→类目/AI/审核 流水线…"
+      : "正在用已采商品启动流水线（不再重采）…",
+  );
   try {
     const job = await apiRequest<{ job_no: string }>("/api/shop-pipeline/from-collection", {
       method: "POST",
@@ -115,8 +148,8 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
         limit: task.success_count || undefined,
       }),
     });
-    store.showNotice(`流水线已启动：${job.job_no}，可到「店铺流水线」查看进度`);
-    store.setModule("shop-pipeline");
+    store.showNotice(`流水线已启动：${job.job_no}`);
+    panel.value = "pipeline";
     await store.refreshAll();
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
@@ -130,6 +163,19 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
   <div class="erp-stack">
     <ErpPageHeader :title="module.label" :description="module.description" />
 
+    <div class="collect-tabs">
+      <button type="button" :class="{ active: panel === 'collect' }" @click="panel = 'collect'">
+        采集
+      </button>
+      <button type="button" :class="{ active: panel === 'pipeline' }" @click="panel = 'pipeline'">
+        店铺流水线
+      </button>
+    </div>
+
+    <ShopPipelineView v-if="panel === 'pipeline'" embedded />
+
+    <template v-else>
+
     <ErpStatGrid
       :items="[
         { label: '商品总数', value: store.stats.value.products, hint: '已入库 Ozon 商品' },
@@ -139,14 +185,14 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
       ]"
     />
 
-    <ErpCard title="链接采集" description="粘贴 Ozon 商品或店铺链接。Cookie 只配 .env 的 OZON_COOKIE 一套即可（采集与类目解析共用）">
+    <ErpCard title="链接采集" description="支持 Ozon 商品/店铺，或 1688 整店链接（需调试 Chrome 已登录 1688）">
       <div class="erp-form-row">
         <label class="erp-field erp-field--grow">
-          <span>Ozon 链接</span>
+          <span>采集链接</span>
           <input
             v-model="collectionUrl"
             type="text"
-            placeholder="https://www.ozon.ru/product/... 或 seller 链接"
+            placeholder="Ozon 链接，或 https://shopXXXX.1688.com/"
           />
         </label>
         <ErpButton :disabled="collecting || store.loading.value" @click="submitCollection">
@@ -160,6 +206,7 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
         <table class="erp-table">
           <thead>
             <tr>
+              <th>平台</th>
               <th>商品</th>
               <th>采集链接</th>
               <th>价格</th>
@@ -169,6 +216,7 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
           </thead>
           <tbody>
             <tr v-for="{ item, collectUrl } in productRows" :key="item.id">
+              <td>{{ item.platform === '1688' ? '1688' : 'Ozon' }}</td>
               <td>
                 <ErpProductCell
                   :image-url="item.main_image_url"
@@ -189,7 +237,7 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
                 </a>
                 <span v-else>-</span>
               </td>
-              <td>{{ item.variants?.[0]?.price_text ?? "-" }}</td>
+              <td>{{ rowPrice(item) }}</td>
               <td>{{ item.sales_rank ?? "-" }}</td>
               <td>{{ item.brand || "-" }}</td>
             </tr>
@@ -268,10 +316,31 @@ async function startPipelineFromTask(task: OzonCollectionTask): Promise<void> {
       </div>
       <ErpEmpty v-else message="暂无采集任务" />
     </ErpCard>
+    </template>
   </div>
 </template>
 
 <style scoped>
+.collect-tabs {
+  display: flex;
+  gap: 8px;
+}
+
+.collect-tabs button {
+  border: 1px solid rgba(16, 24, 40, 0.12);
+  background: #fff;
+  border-radius: 999px;
+  padding: 6px 14px;
+  cursor: pointer;
+  color: #344054;
+}
+
+.collect-tabs button.active {
+  background: #155364;
+  border-color: #155364;
+  color: #fff;
+}
+
 .task-meta {
   display: grid;
   gap: 4px;

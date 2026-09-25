@@ -89,9 +89,32 @@ function canRefresh(task: OzonPublishTask): boolean {
   ].includes(task.status);
 }
 
+function publishStatusLabel(status: string): string | undefined {
+  if (status === "running" || status === "processing" || status === "submitted" || status === "awaiting_pull") {
+    return "Ozon 处理中";
+  }
+  if (status === "pushed" || status === "partial") {
+    return "已推送，还不可售";
+  }
+  return undefined;
+}
+
+function blockingPublishTask(editId: number): OzonPublishTask | undefined {
+  const blocking = ["awaiting_pull", "submitted", "running", "processing", "pushed", "partial"];
+  return store.state.value.publishTasks
+    .filter((task) => task.edit_id === editId && blocking.includes(task.status))
+    .sort((a, b) => b.id - a.id)[0];
+}
+
+function blockingPublishLabel(task: OzonPublishTask | undefined): string {
+  if (!task) return "";
+  if (task.status === "pushed" || task.status === "partial") return "已推送，还不可售";
+  return "Ozon 处理中";
+}
+
 function resultLabel(task: OzonPublishTask): string {
   if (task.status === "awaiting_pull" || task.status === "submitted" || task.status === "running") {
-    return `待拉取 · ${task.total_count} SKU`;
+    return `已提交，等 Ozon 处理 · ${task.total_count} SKU`;
   }
   if (task.status === "pushed" || task.status === "partial") {
     return `已推送（待可售）· ${task.total_count} SKU`;
@@ -186,8 +209,8 @@ async function reopenEdit(editId: number): Promise<void> {
     await apiRequest<ProductEdit>(`/api/ozon/publish-tasks/reopen-edit/${editId}`, {
       method: "POST",
     });
-    store.showNotice("已重新打开编辑，请修复后重新生成 Listing 并审核");
-    store.setModule("product-edit");
+    store.showNotice("已退回审核中心，可继续修改");
+    store.setModule("review");
     await store.refreshAll();
   } catch (err) {
     store.showError(err instanceof Error ? err.message : String(err));
@@ -359,7 +382,7 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
         </label>
       </div>
       <p class="erp-detail-text">
-        状态说明：推送成功→「待拉取」；拉取后有档案但不可售→「已推送」；确认可售→「上架成功」；推送时报错→「推送失败」。
+        状态说明：点「推送到 Ozon」后，任务是「Ozon 处理中」，这时上面不再出现推送按钮。拉取后有档案但不可售→「已推送，还不可售」；确认可售→「上架成功」；推送时报错→「推送失败」。
         拉取时会调用 `/v1/barcode/generate` 生成条码，并尝试推 rFBS 库存。
       </p>
     </ErpCard>
@@ -390,10 +413,18 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
                     :subtitle="resolveEditSubtitle(edit)"
                   />
                 </td>
-                <td><ErpBadge :status="edit.status" /></td>
+                <td><ErpBadge :status="edit.status" :label="blockingPublishTask(edit.id) ? blockingPublishLabel(blockingPublishTask(edit.id)) : undefined" /></td>
                 <td @click.stop>
                   <div class="erp-table-actions">
                     <ErpButton
+                      v-if="blockingPublishTask(edit.id)"
+                      size="sm"
+                      disabled
+                    >
+                      {{ blockingPublishLabel(blockingPublishTask(edit.id)) }}
+                    </ErpButton>
+                    <ErpButton
+                      v-else
                       size="sm"
                       :disabled="isPublishingBusy || store.loading.value"
                       @click="publish(edit.id)"
@@ -448,14 +479,16 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
             <table class="erp-table">
               <thead>
                 <tr>
-                  <th>SKU</th>
-                  <th>价格</th>
-                  <th>库存</th>
+                <th>SKU</th>
+                <th>标题</th>
+                <th>价格</th>
+                <th>库存</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="variant in selectedEdit.variants" :key="variant.id">
                   <td>{{ variant.sku }}</td>
+                  <td>{{ variant.title || "-" }}</td>
                   <td>{{ formatMoney(variant.price, resolveCurrencyCode(selectedEdit.attributes)) }}</td>
                   <td>{{ variant.quantity }}</td>
                 </tr>
@@ -493,7 +526,7 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
                     :subtitle="`${task.task_no}${task.family_external_id ? ` · ${task.family_external_id}` : ''}`"
                   />
                 </td>
-                <td><ErpBadge :status="task.status" /></td>
+                <td><ErpBadge :status="task.status" :label="publishStatusLabel(task.status)" /></td>
                 <td>{{ resultLabel(task) }}</td>
               </tr>
             </tbody>
@@ -513,7 +546,7 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
             />
             <div class="erp-detail-hero__copy">
               <div class="erp-detail-hero__meta">
-                <ErpBadge :status="taskDetail.status" />
+                <ErpBadge :status="taskDetail.status" :label="publishStatusLabel(taskDetail.status)" />
                 <span>{{ taskDetail.shop_name || "-" }}</span>
                 <span v-if="taskDetail.ozon_import_task_id">
                   Ozon 任务 {{ taskDetail.ozon_import_task_id }}
@@ -559,14 +592,14 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
               {{ refreshing ? "拉取中…" : "拉取上架状态" }}
             </ErpButton>
             <ErpButton
-              v-if="taskDetail.status === 'listed' || taskDetail.status === 'completed' || taskDetail.edit_status === 'published' || taskDetail.status === 'running' || taskDetail.status === 'awaiting_pull' || taskDetail.status === 'pushed' || taskDetail.status === 'partial'"
+              v-if="taskDetail.status === 'listed' || taskDetail.status === 'completed' || taskDetail.edit_status === 'published' || taskDetail.status === 'pushed' || taskDetail.status === 'partial'"
               :disabled="isPublishingBusy"
               @click="republishListed(taskDetail.edit_id)"
             >
               {{ republishingEditId === taskDetail.edit_id ? "更新推送中…" : "更新上架内容" }}
             </ErpButton>
             <ErpButton
-              v-if="taskDetail.status === 'failed' || taskDetail.status === 'pushed' || taskDetail.status === 'partial' || taskDetail.edit_status === 'approved'"
+              v-if="taskDetail.status === 'failed' || taskDetail.status === 'pushed' || taskDetail.status === 'partial'"
               variant="secondary"
               :disabled="isPublishingBusy"
               @click="publish(taskDetail.edit_id)"

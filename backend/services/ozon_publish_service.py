@@ -10,7 +10,6 @@ from db.ozon_workflow import (
     get_ozon_publish_task,
     get_product_edit,
     list_ozon_publish_tasks,
-    reopen_product_edit,
 )
 from db.serialization import to_json
 from integrations.ozon_seller.client import OzonSellerClient, OzonSellerError
@@ -18,6 +17,7 @@ from services.ozon_import_status import (
     aggregate_task_status,
     extract_import_task_id,
     is_ozon_product_sellable,
+    local_status_from_product,
     map_ozon_import_raw_status,
     parse_import_info_items,
     parse_product_info_items,
@@ -77,8 +77,21 @@ def get_task(task_id: int) -> dict[str, Any]:
 
 
 def reopen_edit_from_publish(edit_id: int) -> dict[str, Any]:
-    """发布失败或审核通过后需修改内容时，重新打开编辑。"""
-    return reopen_product_edit(edit_id)
+    """退回审核中心继续改，不把状态设成编辑中，否则侧边栏看不到。"""
+    from db.ozon_workflow import get_product_edit, update_product_edit
+
+    edit = get_product_edit(edit_id)
+    if edit["status"] not in (
+        "listing_ready",
+        "pending_review",
+        "needs_fix",
+        "approved",
+        "rejected",
+        "published",
+        "editing",
+    ):
+        raise ValueError("当前状态不可退回审核")
+    return update_product_edit(edit_id, status="pending_review", clear_listing=False)
 
 
 def republish_listed_edit(edit_id: int, *, auto_follow: bool = True) -> dict[str, Any]:
@@ -233,13 +246,13 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
                 product_info = product_by_offer.get(sku)
                 if ozon_item is None and product_info:
                     # 导入明细暂无，但商品详情已有 → 按已有商品结算
-                    local_status = "listed" if is_ozon_product_sellable(product_info) else "pushed"
+                    local_status, error_code, error_message = local_status_from_product(product_info)
                     pid = product_info.get("id") or product_info.get("product_id")
                     try:
                         pid_int = int(pid or 0)
                     except (TypeError, ValueError):
                         pid_int = 0
-                    if pid_int > 0 and local_status in {"pushed", "listed"}:
+                    if pid_int > 0 and local_status in {"pushed", "listed", "paused"}:
                         barcode_product_ids.append(str(pid_int))
                     if local_status in {"pushed", "listed"} and sku:
                         stock_candidates.append(sku)
@@ -258,8 +271,8 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
                             local_status,
                             str(pid_int) if pid_int > 0 else None,
                             sku,
-                            None if local_status == "listed" else "NOT_SELLABLE_YET",
-                            None if local_status == "listed" else "商品已在 Ozon，但尚不可售（请确认库存/校验）",
+                            error_code,
+                            error_message,
                             to_json({"product_info": product_info, "note": "synced_by_offer"}),
                             item["id"],
                         ),
@@ -394,15 +407,15 @@ def _refresh_status_from_existing_offers(task_id: int) -> dict[str, Any]:
                     )
                     continue
 
-                local_status = "listed" if is_ozon_product_sellable(product_info) else "pushed"
+                local_status, pause_code, pause_message = local_status_from_product(product_info)
                 pid = product_info.get("id") or product_info.get("product_id")
                 try:
                     pid_int = int(pid or 0)
                 except (TypeError, ValueError):
                     pid_int = 0
-                if pid_int > 0:
+                if pid_int > 0 and local_status != "paused":
                     barcode_product_ids.append(str(pid_int))
-                if sku:
+                if sku and local_status != "paused":
                     stock_candidates.append(sku)
 
                 # 补写最小提交快照，方便详情页展示
@@ -438,8 +451,8 @@ def _refresh_status_from_existing_offers(task_id: int) -> dict[str, Any]:
                         local_status,
                         str(pid_int) if pid_int > 0 else None,
                         sku,
-                        None if local_status == "listed" else "NOT_SELLABLE_YET",
-                        None if local_status == "listed" else "商品已在 Ozon，但尚不可售（请确认库存/校验）",
+                        pause_code,
+                        pause_message,
                         to_json(
                             {
                                 "product_info": product_info,
@@ -523,7 +536,7 @@ def _finalize_after_status_sync(
                 fresh = get_ozon_publish_task(task_id)
                 for item in fresh.get("items") or []:
                     sku = str(item.get("seller_sku") or "").strip()
-                    if str(item.get("status") or "") not in {"pushed", "listed"}:
+                    if str(item.get("status") or "") not in {"pushed", "listed", "paused"}:
                         continue
                     product_info = refreshed_products.get(sku) or product_by_offer.get(sku)
                     payload = item.get("response_payload")
@@ -535,11 +548,7 @@ def _finalize_after_status_sync(
                         "stocks": stock_result,
                         "barcodes": barcode_result,
                     }
-                    new_status = "listed" if is_ozon_product_sellable(product_info) else "pushed"
-                    error_code = None if new_status == "listed" else (item.get("error_code") or "NOT_SELLABLE_YET")
-                    error_message = None
-                    if new_status == "pushed":
-                        error_message = item.get("error_message") or "商品已在 Ozon，但尚不可售（请确认库存/校验）"
+                    new_status, error_code, error_message = local_status_from_product(product_info)
                     cursor.execute(
                         """
                         UPDATE ozon_publish_item
@@ -699,8 +708,29 @@ def _submit_via_ozon_api(task_id: int) -> None:
                 f"Ozon import 未返回 task_id，响应: {str(import_result)[:400]}"
             )
 
+        price_rows = [
+            {
+                "offer_id": str(item.get("offer_id") or ""),
+                "price": str(item.get("price") or ""),
+                "old_price": str(item.get("old_price") or ""),
+                "currency_code": str(item.get("currency_code") or "CNY"),
+                "vat": str(item.get("vat") or "0"),
+            }
+            for item in payload_items
+            if item.get("offer_id") and item.get("price") and item.get("old_price")
+        ]
+        price_result: dict[str, Any] | None = None
+        price_error: str | None = None
+        if price_rows:
+            try:
+                price_result = client.import_prices(price_rows)
+            except OzonSellerError as exc:
+                price_error = str(exc)
+
         response_blob = {
             "import": import_result,
+            "prices": price_result,
+            "price_error": price_error,
             "ozon_import_task_id": import_task_id,
             "fulfillment": "rFBS",
             "phase": "awaiting_pull",
@@ -881,7 +911,7 @@ def _recompute_task_totals(task_id: int) -> dict[str, Any]:
     task = get_ozon_publish_task(task_id)
     items = task.get("items") or []
     statuses = [str(item.get("status") or "") for item in items]
-    success_count = sum(1 for s in statuses if s in {"listed", "success", "completed"})
+    success_count = sum(1 for s in statuses if s in {"listed", "success", "completed", "paused"})
     fail_count = sum(1 for s in statuses if s == "failed")
     task_status = aggregate_task_status(statuses)
     finished = task_status in {"listed", "failed", "pushed", "completed", "partial"}
@@ -925,6 +955,14 @@ def _recompute_task_totals(task_id: int) -> dict[str, Any]:
                     ("published", task["edit_id"]),
                 )
 
+    from db.shop_pipeline import sync_pipeline_item_for_edit
+
+    sync_pipeline_item_for_edit(
+        int(task["edit_id"]),
+        publish_status=task_status,
+        publish_task_id=task_id,
+        error_message=task_error,
+    )
     return get_ozon_publish_task(task_id)
 
 

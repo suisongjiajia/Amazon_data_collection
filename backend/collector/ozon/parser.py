@@ -68,7 +68,33 @@ def widgets(page: dict[str, Any], name: str) -> list[dict[str, Any]]:
     return parsed
 
 
+def parse_rating(text: Any) -> float | None:
+    """Ozon 评分是 0–5。中文页面上的「16 和 1 P」这类文案不能拿去 float()。"""
+    raw = str(text or "").replace("\u00a0", "").replace("\u2009", "").replace(" ", "")
+    raw = raw.replace(",", ".")
+    if not re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+    if value < 0 or value > 5:
+        return None
+    return value
+
+
 def price_to_number(text: Any) -> int | None:
+    if isinstance(text, bool) or text is None:
+        return None
+    if isinstance(text, (int, float)):
+        return int(text) if text > 0 else None
+    if isinstance(text, dict):
+        for key in ("price", "text", "cardPrice", "value"):
+            if key in text:
+                parsed = price_to_number(text.get(key))
+                if parsed is not None:
+                    return parsed
+        return None
     if not isinstance(text, str):
         return None
     digits = re.sub(r"[^\d]", "", text)
@@ -125,7 +151,7 @@ def parse_search_item(item: dict[str, Any]) -> dict[str, Any] | None:
     if isinstance(rating_list, list):
         texts = [x.get("text", {}).get("text") for x in rating_list if x.get("type") == "text"]
         if texts and texts[0]:
-            rating = float(str(texts[0]).replace(",", "."))
+            rating = parse_rating(texts[0])
         if len(texts) > 1 and texts[1]:
             reviews = price_to_number(texts[1])
 
@@ -178,30 +204,85 @@ def parse_search_item(item: dict[str, Any]) -> dict[str, Any] | None:
     }
 
 
-def parse_listing_page(page: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
-    grid = widget(page, "tileGridDesktop")
-    if not grid:
-        # Legacy widget name still seen on some pages.
-        for legacy_name in ("searchResultsV2", "tileGrid"):
-            legacy = widget(page, legacy_name)
-            if legacy and legacy.get("items"):
-                grid = legacy
-                break
+_RECOMMENDATION_TITLE_MARKERS = (
+    "вам понравится",
+    "подобрали для вас",
+    "рекоменд",
+    "похож",
+    "you may also like",
+    "您可能喜欢",
+    "猜你喜欢",
+    "为你推荐",
+    "相似",
+    "类似",
+)
 
-    raw_items = (grid or {}).get("items") or []
+
+def _grid_header_text(grid: dict[str, Any]) -> str:
+    header = grid.get("header")
+    if not isinstance(header, dict):
+        return ""
+    title = header.get("title")
+    if isinstance(title, dict):
+        return str(title.get("text") or "").strip()
+    if isinstance(title, str):
+        return title.strip()
+    return ""
+
+
+def is_recommendation_grid(grid: dict[str, Any]) -> bool:
+    """店铺页底部「您可能喜欢」等推荐架，商品不属于当前店铺。"""
+    text = _grid_header_text(grid).lower()
+    if not text:
+        return False
+    return any(marker in text for marker in _RECOMMENDATION_TITLE_MARKERS)
+
+
+def catalog_listing_grids(page: dict[str, Any]) -> list[dict[str, Any]]:
+    grids = widgets(page, "tileGridDesktop")
+    if not grids:
+        for legacy_name in ("searchResultsV2", "tileGrid"):
+            grids = widgets(page, legacy_name)
+            if grids:
+                break
+    return [grid for grid in grids if grid.get("items") and not is_recommendation_grid(grid)]
+
+
+def parse_listing_page(page: dict[str, Any], limit: int = 50) -> list[dict[str, Any]]:
+    raw_items: list[Any] = []
+    for grid in catalog_listing_grids(page):
+        raw_items.extend(grid.get("items") or [])
     items = [parsed for parsed in (parse_search_item(item) for item in raw_items) if parsed]
     return items[:limit]
 
 
-def extract_next_page_path(page: dict[str, Any]) -> str | None:
-    grid = widget(page, "tileGridDesktop")
-    if not grid:
+def _next_page_from_paginator(paginator: Any) -> str | None:
+    if not isinstance(paginator, dict):
         return None
-    paginator = grid.get("infiniteVirtualPaginator") or grid.get("paginator") or {}
     next_page = paginator.get("nextPage")
-    if isinstance(next_page, str) and next_page.strip():
-        return next_page if next_page.startswith("/") else f"/{next_page.lstrip('/')}"
-    return None
+    if not isinstance(next_page, str) or not next_page.strip():
+        return None
+    path = next_page.strip()
+    return path if path.startswith("/") else f"/{path.lstrip('/')}"
+
+
+def extract_next_page_path(page: dict[str, Any]) -> str | None:
+    """下一页可能在商品网格里，也可能在单独的 infiniteVirtualPaginator 组件上。"""
+    found: list[str] = []
+    for grid in catalog_listing_grids(page):
+        path = _next_page_from_paginator(grid.get("infiniteVirtualPaginator") or grid.get("paginator"))
+        if path:
+            found.append(path)
+    for paginator in widgets(page, "infiniteVirtualPaginator"):
+        path = _next_page_from_paginator(paginator)
+        if path and path not in found:
+            found.append(path)
+    if not found:
+        return None
+    for path in found:
+        if "/seller/" in path:
+            return path
+    return found[0]
 
 
 def rs_text(nodes: Any) -> str:
@@ -504,9 +585,11 @@ def parse_product_details(base_page: dict[str, Any], page2: dict[str, Any] | Non
     description_category_id, type_id = parse_description_category_and_type(base_page, page2)
     size, weight = derive_size_and_weight(attributes)
 
-    price = price_to_number((price_widget or {}).get("cardPrice"))
-    if price is None and price_widget:
-        price = price_to_number(price_widget.get("price"))
+    # 普通售价优先（页面灰字），Ozon 卡价单独保存，避免把绿框卡价当成售价
+    card_price = price_to_number((price_widget or {}).get("cardPrice"))
+    price = price_to_number((price_widget or {}).get("price")) if price_widget else None
+    if price is None:
+        price = card_price
     if price is None:
         price = _extract_price_from_widgets(base_page)
 
@@ -516,21 +599,7 @@ def parse_product_details(base_page: dict[str, Any], page2: dict[str, Any] | Non
 
     aspect_variants = parse_product_aspects(base_page)
     if page2:
-        # page2 偶尔也会带 aspects；合并去重
-        merged = {item["sku"]: item for item in aspect_variants}
-        for item in parse_product_aspects(page2):
-            existing = merged.get(item["sku"])
-            if existing is None:
-                merged[item["sku"]] = item
-            else:
-                attrs = dict(existing.get("attributes") or {})
-                attrs.update(item.get("attributes") or {})
-                existing["attributes"] = attrs
-                if not existing.get("image") and item.get("image"):
-                    existing["image"] = item["image"]
-                if existing.get("price") is None and item.get("price") is not None:
-                    existing["price"] = item["price"]
-        aspect_variants = list(merged.values())
+        aspect_variants = merge_aspect_variants(aspect_variants, parse_product_aspects(page2))
 
     # 当前选中规格写回 attributes，便于单变体场景
     for item in aspect_variants:
@@ -544,6 +613,7 @@ def parse_product_details(base_page: dict[str, Any], page2: dict[str, Any] | Non
         "name": name,
         "url": url,
         "price": price,
+        "card_price": card_price,
         "old_price": price_to_number((price_widget or {}).get("originalPrice")),
         "rating": rating,
         "reviews": reviews,
@@ -565,6 +635,7 @@ def parse_product_aspects(page: dict[str, Any]) -> list[dict[str, Any]]:
     """
     解析 PDP 规格选择器（颜色/尺码等），得到兄弟 SKU 列表。
     每项: sku / url / label / attributes / image / price / active
+    多区分项时，同一 SKU 会合并多个 aspect 的属性。
     """
     by_sku: dict[str, dict[str, Any]] = {}
 
@@ -613,23 +684,102 @@ def parse_product_aspects(page: dict[str, Any]) -> list[dict[str, Any]]:
     for widget_data in _iter_widget_json(page):
         if isinstance(widget_data.get("aspects"), list):
             _ingest_aspects_block(widget_data, upsert)
-        # 某些结构把 aspects 放在 data / state 下
         for nest_key in ("data", "state", "payload"):
             nested = widget_data.get(nest_key)
             if isinstance(nested, dict) and isinstance(nested.get("aspects"), list):
                 _ingest_aspects_block(nested, upsert)
 
+    return finalize_aspect_variants(list(by_sku.values()))
+
+
+def finalize_aspect_variants(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """补全 label / url，并把当前选中的 SKU 排到前面。"""
     results: list[dict[str, Any]] = []
-    for entry in by_sku.values():
-        attrs = entry.get("attributes") or {}
-        label = " / ".join(str(v) for v in attrs.values() if v)
-        entry["label"] = label
-        if not entry.get("url"):
-            entry["url"] = f"https://www.ozon.ru/product/{entry['sku']}/"
-        results.append(entry)
-    # 当前选中的排前面
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        sku = str(entry.get("sku") or "").strip()
+        if not sku.isdigit():
+            continue
+        attrs = {
+            str(key): str(value)
+            for key, value in (entry.get("attributes") or {}).items()
+            if str(key).strip() and str(value).strip()
+        }
+        label = " / ".join(str(value) for value in attrs.values() if value)
+        url = entry.get("url")
+        if not url:
+            url = f"https://www.ozon.ru/product/{sku}/"
+        image = entry.get("image")
+        if isinstance(image, str) and "/wc140/" in image:
+            image = image.replace("/wc140/", "/wc1200/")
+        results.append(
+            {
+                "sku": sku,
+                "url": clean_url(url) or f"https://www.ozon.ru/product/{sku}/",
+                "attributes": attrs,
+                "image": image,
+                "price": entry.get("price"),
+                "active": bool(entry.get("active")),
+                "label": label,
+            }
+        )
     results.sort(key=lambda item: (0 if item.get("active") else 1, item.get("sku") or ""))
     return results
+
+
+def merge_aspect_variants(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    合并多页 aspects。多区分项商品首屏往往只带「当前颜色的尺码 + 当前尺码的颜色」，
+    需要把兄弟 SKU 页的 aspects 合并，才能得到每个 SKU 的完整属性。
+    """
+    by_sku: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for item in group or []:
+            if not isinstance(item, dict):
+                continue
+            sku = str(item.get("sku") or "").strip()
+            if not sku.isdigit():
+                continue
+            entry = by_sku.get(sku)
+            if entry is None:
+                entry = {
+                    "sku": sku,
+                    "url": item.get("url"),
+                    "attributes": {},
+                    "image": item.get("image"),
+                    "price": item.get("price"),
+                    "active": bool(item.get("active")),
+                    "label": "",
+                }
+                by_sku[sku] = entry
+            attrs = item.get("attributes") if isinstance(item.get("attributes"), dict) else {}
+            for key, value in attrs.items():
+                text_key = str(key).strip()
+                text_value = str(value).strip()
+                if text_key and text_value:
+                    entry["attributes"][text_key] = text_value
+            if item.get("url") and not entry.get("url"):
+                entry["url"] = item.get("url")
+            if item.get("image") and not entry.get("image"):
+                entry["image"] = item.get("image")
+            if item.get("price") is not None and entry.get("price") is None:
+                entry["price"] = item.get("price")
+            if item.get("active"):
+                entry["active"] = True
+    return finalize_aspect_variants(list(by_sku.values()))
+
+
+def aspect_variant_skus(aspect_variants: list[dict[str, Any]]) -> list[str]:
+    skus: list[str] = []
+    seen: set[str] = set()
+    for item in aspect_variants or []:
+        sku = str((item or {}).get("sku") or "").strip()
+        if not sku.isdigit() or sku in seen:
+            continue
+        seen.add(sku)
+        skus.append(sku)
+    return skus
 
 
 def _ingest_aspects_block(block: dict[str, Any], upsert: Any) -> None:
@@ -642,6 +792,7 @@ def _ingest_aspects_block(block: dict[str, Any], upsert: Any) -> None:
         aspect_name = str(
             aspect.get("name")
             or aspect.get("aspectName")
+            or aspect.get("aspectKey")
             or aspect.get("key")
             or aspect.get("title")
             or "Вариант"
@@ -672,13 +823,18 @@ def _ingest_aspects_block(block: dict[str, Any], upsert: Any) -> None:
             )
             if isinstance(image, dict):
                 image = image.get("src") or image.get("link") or image.get("url")
+            if isinstance(image, str) and "/wc140/" in image:
+                image = image.replace("/wc140/", "/wc1200/")
+            price: int | None = None
             raw_price = variant.get("price")
             if raw_price is None:
                 raw_price = variant.get("cardPrice")
-            if isinstance(raw_price, (int, float)):
-                price = int(raw_price)
+            if isinstance(raw_price, (int, float)) and not isinstance(raw_price, bool):
+                price = int(raw_price) if raw_price > 0 else None
             else:
-                price = price_to_number(str(raw_price or ""))
+                price = price_to_number(raw_price)
+            if price is None and data.get("price") is not None:
+                price = price_to_number(data.get("price"))
             if price is None and variant.get("finalPrice") is not None:
                 try:
                     price = int(float(variant.get("finalPrice")))
@@ -740,12 +896,12 @@ def _extract_sku_from_widgets(page: dict[str, Any]) -> str | None:
 
 def _extract_price_from_widgets(page: dict[str, Any]) -> int | None:
     for widget_data in _iter_widget_json(page):
-        if widget_data.get("cardPrice"):
-            return price_to_number(widget_data.get("cardPrice"))
-        if widget_data.get("price"):
-            return price_to_number(widget_data.get("price"))
-        if widget_data.get("finalPrice"):
-            return price_to_number(str(widget_data.get("finalPrice")))
+        for key in ("price", "cardPrice", "finalPrice"):
+            if key not in widget_data:
+                continue
+            parsed = price_to_number(widget_data.get(key))
+            if parsed is not None:
+                return parsed
     return None
 
 

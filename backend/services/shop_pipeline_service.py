@@ -11,6 +11,7 @@ from db.ozon_workflow import get_product_edit, update_product_edit
 from db.shop_pipeline import (
     create_pipeline_item,
     create_pipeline_job,
+    delete_pipeline_item,
     get_pipeline_item,
     get_pipeline_job,
     list_pipeline_jobs,
@@ -196,10 +197,16 @@ def start_pipeline_from_collection_task(
 
 
 def list_jobs(limit: int = 50) -> list[dict[str, Any]]:
+    from db.shop_pipeline import reconcile_pipeline_jobs
+
+    reconcile_pipeline_jobs()
     return list_pipeline_jobs(limit)
 
 
 def get_job(job_id: int) -> dict[str, Any]:
+    from db.shop_pipeline import reconcile_pipeline_jobs
+
+    reconcile_pipeline_jobs()
     return get_pipeline_job(job_id)
 
 
@@ -225,6 +232,10 @@ def retry_item(item_id: int) -> dict[str, Any]:
     recount_pipeline_job(int(item["job_id"]))
     _spawn_item(item_id)
     return get_pipeline_item(item_id)
+
+
+def delete_item(item_id: int) -> dict[str, Any]:
+    return delete_pipeline_item(item_id)
 
 
 def _spawn_job(job_id: int, *, process_only: bool = False) -> None:
@@ -362,6 +373,13 @@ def _process_one_item_with_retries(item_id: int) -> None:
 def _process_one_item(item_id: int, *, attempt: int = 1) -> None:
     item = get_pipeline_item(item_id)
     family_id = int(item["raw_product_family_id"])
+    from db.ozon_catalog import get_ozon_product_family
+
+    family = get_ozon_product_family(family_id)
+    if str(family.get("platform") or "") == "1688":
+        _process_1688_item(item_id, family_id, attempt=attempt)
+        return
+
     top_n = _supplier_top_n()
     detail: dict[str, Any] = dict(item.get("stage_detail") or {})
     detail["auto_retry_count"] = attempt
@@ -418,6 +436,61 @@ def _process_one_item(item_id: int, *, attempt: int = 1) -> None:
     )
 
     # 3) 生成 Listing 并提交审核
+    update_pipeline_item(item_id, status="listing")
+    built = product_edit_service.build_listing(int(edit["id"]))
+    if not built.get("ok") or not built.get("saved"):
+        messages = "; ".join(
+            issue.get("message") or ""
+            for issue in (built.get("issues") or [])
+            if issue.get("severity") == "error"
+        )
+        raise ValueError(f"Listing 生成失败：{messages or built.get('build_error') or '校验未通过'}")
+
+    submitted = product_edit_service.submit_for_review(int(edit["id"]))
+    update_pipeline_item(
+        item_id,
+        status="pending_review",
+        edit_id=int(submitted["id"]) if submitted.get("id") else int(edit["id"]),
+        stage_detail=detail,
+        clear_error=True,
+    )
+
+
+def _process_1688_item(item_id: int, family_id: int, *, attempt: int = 1) -> None:
+    """1688 直采：匹配类目 → AI 俄语稿 → Listing → 进审核（跳过图搜）。"""
+    from services.ozon_category_match_service import match_category_for_family
+
+    detail: dict[str, Any] = dict(get_pipeline_item(item_id).get("stage_detail") or {})
+    detail["auto_retry_count"] = attempt
+    detail["source_platform"] = "1688"
+
+    update_pipeline_item(item_id, status="sourcing", clear_error=True, stage_detail=detail)
+    matched = match_category_for_family(family_id, force=False)
+    detail["category_match"] = {
+        "description_category_id": matched.get("description_category_id"),
+        "type_id": matched.get("type_id"),
+        "type_name": matched.get("type_name"),
+        "source": matched.get("source"),
+        "score": matched.get("score"),
+        "ai_reason": matched.get("ai_reason"),
+    }
+    update_pipeline_item(item_id, stage_detail=detail)
+
+    update_pipeline_item(item_id, status="editing")
+    ai_result = ai_product_edit_service.generate_product_edit(
+        family_id,
+        rehost_images=_rehost_images(),
+    )
+    edit = product_edit_service.create_edit(family_id)
+    edit = apply_ai_suggestion_to_edit(int(edit["id"]), ai_result["suggestion"])
+    detail["pricing"] = ai_result.get("pricing")
+    detail["listing_notes"] = (ai_result.get("suggestion") or {}).get("listing_notes")
+    update_pipeline_item(
+        item_id,
+        edit_id=int(edit["id"]),
+        stage_detail=detail,
+    )
+
     update_pipeline_item(item_id, status="listing")
     built = product_edit_service.build_listing(int(edit["id"]))
     if not built.get("ok") or not built.get("saved"):

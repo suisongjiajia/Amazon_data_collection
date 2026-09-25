@@ -93,7 +93,7 @@ def list_ozon_collection_tasks(limit: int = 50) -> list[dict[str, Any]]:
     return fetch_all(
         """
         SELECT * FROM collection_task
-        WHERE platform = 'ozon'
+        WHERE platform IN ('ozon', '1688')
         ORDER BY created_at DESC
         LIMIT %s
         """,
@@ -179,7 +179,44 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
                 family_id = int(family_row[0])
 
                 for variant in product.get("variants") or []:
-                    asin = variant.get("external_id") or f"{family_key}-default"
+                    external_id = str(variant.get("external_id") or f"{family_key}-default")
+                    # asin 全局唯一。同一 SKU 既是自己的商品、又是别的商品的兄弟规格时，
+                    # 不能共用一个 asin，否则这条商品会没有变体，列表价格变成空。
+                    cursor.execute(
+                        """
+                        SELECT id FROM raw_product_variant
+                        WHERE family_id = %s AND external_id = %s
+                        """,
+                        (family_id, external_id),
+                    )
+                    existing = cursor.fetchone()
+                    asin = f"{family_id}:{external_id}"[:32]
+                    if existing:
+                        cursor.execute(
+                            """
+                            UPDATE raw_product_variant
+                            SET source_url = COALESCE(%s, source_url),
+                                title = COALESCE(%s, title),
+                                price_text = COALESCE(%s, price_text),
+                                main_image_url = COALESCE(%s, main_image_url),
+                                variant_attributes = %s,
+                                raw_payload = %s,
+                                snapshot_time = %s,
+                                updated_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
+                            """,
+                            (
+                                variant.get("source_url"),
+                                variant.get("title"),
+                                variant.get("price_text"),
+                                variant.get("main_image_url"),
+                                to_json(variant.get("variant_attributes") or {}),
+                                to_json(variant.get("raw_payload") or {}),
+                                variant.get("snapshot_time"),
+                                existing[0],
+                            ),
+                        )
+                        continue
                     cursor.execute(
                         """
                         INSERT INTO raw_product_variant (
@@ -194,19 +231,11 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
                             raw_payload,
                             snapshot_time
                         ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON DUPLICATE KEY UPDATE
-                            title = COALESCE(VALUES(title), title),
-                            price_text = COALESCE(VALUES(price_text), price_text),
-                            main_image_url = COALESCE(VALUES(main_image_url), main_image_url),
-                            variant_attributes = VALUES(variant_attributes),
-                            raw_payload = VALUES(raw_payload),
-                            snapshot_time = VALUES(snapshot_time),
-                            updated_at = CURRENT_TIMESTAMP
                         """,
                         (
                             family_id,
                             asin,
-                            variant.get("external_id"),
+                            external_id,
                             variant.get("source_url"),
                             variant.get("title"),
                             variant.get("price_text"),
@@ -224,11 +253,11 @@ def save_ozon_products(task_id: int, products: list[dict[str, Any]]) -> list[dic
 
 def get_ozon_product_family(family_id: int) -> dict[str, Any]:
     family = fetch_one(
-        "SELECT * FROM raw_product_family WHERE id = %s AND platform = 'ozon'",
+        "SELECT * FROM raw_product_family WHERE id = %s",
         (family_id,),
     )
     if family is None:
-        raise ValueError(f"Ozon product family {family_id} was not found")
+        raise ValueError(f"Product family {family_id} was not found")
     variants = fetch_all(
         "SELECT * FROM raw_product_variant WHERE family_id = %s ORDER BY id",
         (family_id,),
@@ -244,8 +273,8 @@ def list_ozon_product_families(limit: int = 100) -> list[dict[str, Any]]:
         SELECT rf.*,
                (SELECT COUNT(*) FROM raw_product_variant rv WHERE rv.family_id = rf.id) AS variant_count
         FROM raw_product_family rf
-        WHERE rf.platform = 'ozon'
-        ORDER BY rf.sales_rank IS NULL, rf.sales_rank, rf.created_at DESC
+        WHERE rf.platform IN ('ozon', '1688')
+        ORDER BY rf.created_at DESC, rf.sales_rank IS NULL, rf.sales_rank
         LIMIT %s
         """,
         (limit,),
@@ -264,7 +293,8 @@ def list_ozon_product_families_by_task(task_id: int, limit: int = 200) -> list[d
         SELECT rf.*,
                (SELECT COUNT(*) FROM raw_product_variant rv WHERE rv.family_id = rf.id) AS variant_count
         FROM raw_product_family rf
-        WHERE rf.platform = 'ozon' AND rf.task_id = %s
+        WHERE rf.task_id = %s
+          AND rf.platform IN ('ozon', '1688')
         ORDER BY rf.sales_rank IS NULL, rf.sales_rank, rf.id
         LIMIT %s
         """,
@@ -276,3 +306,56 @@ def list_ozon_product_families_by_task(task_id: int, limit: int = 200) -> list[d
             (family["id"],),
         )
     return families
+
+
+def repair_missing_ozon_variants() -> int:
+    """给没有当前货号变体、但详情里已经有价格的商品补一条记录。"""
+    families = fetch_all(
+        """
+        SELECT rf.id, rf.external_id, rf.source_url, rf.title, rf.main_image_url, rf.raw_payload
+        FROM raw_product_family rf
+        WHERE rf.platform = 'ozon'
+          AND rf.external_id IS NOT NULL
+          AND NOT EXISTS (
+              SELECT 1 FROM raw_product_variant rv
+              WHERE rv.family_id = rf.id AND rv.external_id = rf.external_id
+          )
+        """,
+        (),
+    )
+    inserted = 0
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            for family in families:
+                payload = family.get("raw_payload") if isinstance(family.get("raw_payload"), dict) else {}
+                details: dict[str, Any] = {}
+                nested = payload.get("rawPayload") if isinstance(payload.get("rawPayload"), dict) else {}
+                if isinstance(nested.get("details"), dict):
+                    details = nested["details"]
+                elif isinstance(payload.get("details"), dict):
+                    details = payload["details"]
+                price = details.get("price")
+                price_text = (
+                    f"{int(price)} ₽"
+                    if isinstance(price, (int, float)) and not isinstance(price, bool)
+                    else None
+                )
+                external_id = str(family["external_id"])
+                cursor.execute(
+                    """
+                    INSERT INTO raw_product_variant (
+                        family_id, asin, external_id, source_url, title, price_text, main_image_url
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        family["id"],
+                        f"{family['id']}:{external_id}"[:32],
+                        external_id,
+                        family.get("source_url"),
+                        family.get("title"),
+                        price_text,
+                        family.get("main_image_url"),
+                    ),
+                )
+                inserted += 1
+    return inserted

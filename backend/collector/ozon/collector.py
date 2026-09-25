@@ -17,9 +17,13 @@ from collector.ozon.browser_session import (
 )
 from collector.ozon.models import OzonCollectConfig, OzonCollectionStrategy, OzonProductInfo
 from collector.ozon.parser import (
+    aspect_variant_skus,
     extract_composer_from_html,
     extract_next_page_path,
+    finalize_aspect_variants,
+    merge_aspect_variants,
     parse_listing_page,
+    parse_product_aspects,
     parse_product_details,
 )
 from collector.ozon.url_parser import OzonParseResult, OzonUrlParser, OzonUrlType, PRODUCT_IN_JSON
@@ -154,6 +158,21 @@ class OzonCollector:
         if not product_id:
             raise RuntimeError("无法解析 Ozon 商品详情")
 
+        seed_aspects = details.get("aspect_variants") if isinstance(details.get("aspect_variants"), list) else []
+        aspect_variants = self._expand_aspect_variants_bfs(
+            seed_aspects,
+            root_sku=str(product_id),
+        )
+        details["aspect_variants"] = aspect_variants
+        details["aspect_names"] = sorted(
+            {
+                str(key)
+                for item in aspect_variants
+                for key in ((item.get("attributes") or {}).keys())
+                if str(key).strip()
+            }
+        )
+
         category_id = details.get("description_category_id") or details.get("category_id")
         type_id = details.get("type_id")
         seller_tree: dict[str, Any] | None = None
@@ -196,14 +215,58 @@ class OzonCollector:
             raw_payload=raw_payload,
         )
 
+    def _expand_aspect_variants_bfs(
+        self,
+        seed_aspects: list[dict[str, Any]],
+        *,
+        root_sku: str,
+        max_variants: int = 40,
+    ) -> list[dict[str, Any]]:
+        """
+        多区分项商品：首屏 aspects 通常不完整。
+        对发现的兄弟 SKU 逐个补拉 composer，合并颜色/尺码等全部区分项。
+        """
+        merged = merge_aspect_variants(seed_aspects)
+        if len(aspect_variant_skus(merged)) <= 1:
+            return merged
+
+        queue = aspect_variant_skus(merged)
+        visited: set[str] = set()
+        while queue and len(visited) < max_variants:
+            sku = queue.pop(0)
+            if sku in visited:
+                continue
+            visited.add(sku)
+            # 根 SKU 首屏已解析过，不再重复请求
+            if sku == str(root_sku) and seed_aspects:
+                continue
+            try:
+                page = self._fetch_page(f"/product/{sku}/")
+                sibling_aspects = parse_product_aspects(page)
+            except Exception:
+                continue
+            merged = merge_aspect_variants(merged, sibling_aspects)
+            # 只补拉根页面上已经出现的规格，用来补全同一商品的颜色×尺码。
+            # 兄弟页新带出来的 SKU 可以合并进结果，但不再继续往下翻，
+            # 否则会把店铺里另外几件商品串成同一组变体。
+            if len(aspect_variant_skus(merged)) >= max_variants:
+                break
+            self._sleep(max(80, min(self.config.delay_ms, 250)))
+
+        # 根 SKU 标记为当前选中
+        for item in merged:
+            item["active"] = str(item.get("sku") or "") == str(root_sku)
+        return finalize_aspect_variants(merged)[:max_variants]
+
     def _collect_from_listing(self, parsed: OzonParseResult, max_products: int | None = None) -> list[OzonProductInfo]:
         limit = max_products or self.config.max_products
-        product_paths = self._discover_product_paths(parsed, limit=limit)
+        product_paths, listing_prices = self._discover_product_paths(parsed, limit=limit)
         if not product_paths:
             raise RuntimeError("未在页面中发现商品链接，请检查链接或稍后重试")
 
         results: list[OzonProductInfo] = []
         for index, product_path in enumerate(product_paths[:limit]):
+            listing_price = listing_prices.get(product_path)
             try:
                 product_parsed = OzonParseResult(
                     OzonUrlType.PRODUCT,
@@ -214,6 +277,8 @@ class OzonCollector:
                 product = self._collect_product(product_parsed)
                 product.sales_rank = index + 1
                 product.hot_score = float(max(0, 100 - index))
+                if not product.price_text and listing_price:
+                    product.price_text = self._format_price(listing_price)
                 if parsed.seller_slug:
                     product.raw_payload["seller_slug"] = parsed.seller_slug
                 results.append(product)
@@ -224,6 +289,7 @@ class OzonCollector:
                         OzonProductInfo(
                             product_id=product_id,
                             source_url=f"https://www.ozon.ru{product_path}",
+                            price_text=self._format_price(listing_price),
                             sales_rank=index + 1,
                             raw_payload={"error": str(exc), "page_path": product_path},
                         )
@@ -232,14 +298,21 @@ class OzonCollector:
                 self._sleep(self.config.delay_ms)
         return results
 
-    def _discover_product_paths(self, parsed: OzonParseResult, limit: int) -> list[str]:
+    def _discover_product_paths(self, parsed: OzonParseResult, limit: int) -> tuple[list[str], dict[str, int]]:
         paths: list[str] = []
+        listing_prices: dict[str, int] = {}
         seen: set[str] = set()
+        seen_pages: set[str] = set()
         current_path = parsed.page_path
         if not current_path.endswith("/") and "?" not in current_path:
             current_path += "/"
+        # 店铺第一页往往只有几条，翻页组件在网格外面。页数要够走到 top_n。
+        page_cap = max(self.config.max_pages, min(15, (max(limit, 1) + 7) // 8))
 
-        for page_index in range(self.config.max_pages):
+        for page_index in range(page_cap):
+            if current_path in seen_pages:
+                break
+            seen_pages.add(current_path)
             page = self._fetch_page(current_path)
 
             for item in parse_listing_page(page, limit=limit):
@@ -252,23 +325,19 @@ class OzonCollector:
                     if path not in seen:
                         seen.add(path)
                         paths.append(path)
-
-            for path in PRODUCT_IN_JSON.findall(str(page.get("widgetStates") or page)):
-                normalized = path if path.startswith("/") else f"/{path}"
-                if normalized not in seen:
-                    seen.add(normalized)
-                    paths.append(normalized)
+                    if item.get("price") and path not in listing_prices:
+                        listing_prices[path] = int(item["price"])
 
             if len(paths) >= limit:
                 break
 
             next_path = extract_next_page_path(page)
-            if not next_path or page_index + 1 >= self.config.max_pages:
+            if not next_path or page_index + 1 >= page_cap:
                 break
             current_path = next_path
             self._sleep(self.config.listing_page_delay_ms)
 
-        return paths[:limit]
+        return paths[:limit], listing_prices
 
     def _fetch_page(self, page_path: str) -> dict[str, Any]:
         page_path = page_path if page_path.startswith("/") else f"/{page_path}"

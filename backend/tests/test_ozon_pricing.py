@@ -1,5 +1,5 @@
 from services.xingyuan_freight import calc_xingyuan_economy_freight_cny, select_russia_economy_channel
-from services.ozon_pricing_service import calc_suggested_price_rub
+from services.ozon_pricing_service import calc_suggested_price_rub, variant_prices_from_collected
 
 
 def test_select_channel_by_weight():
@@ -40,3 +40,21 @@ def test_pricing_formula_a(monkeypatch):
     )
     assert rub["list_price"] == 1950
     assert rub["currency_code"] == "RUB"
+
+
+def test_variant_prices_follow_collected_ozon_prices():
+    prices = variant_prices_from_collected(
+        58,
+        [
+            {"external_id": "4246785373", "price_text": "1326 ₽"},
+            {"external_id": "4246785076", "price_text": "1147 ₽"},
+            {"external_id": "4246785230", "price_text": "680 ₽"},
+            {"external_id": "4246785481", "price_text": "1235 ₽"},
+        ],
+        anchor_external_id="4246785373",
+    )
+    assert prices[0] == 58
+    assert prices[1] == 50
+    assert prices[2] == 30
+    assert prices[3] == 54
+    assert len(set(prices)) > 1

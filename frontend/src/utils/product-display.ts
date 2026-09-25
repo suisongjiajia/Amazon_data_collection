@@ -31,20 +31,24 @@ export function resolveEditSubtitle(edit: ProductEdit): string {
   if (edit.family_title && edit.family_title !== edit.title) {
     parts.push(`源品 ${edit.family_title}`);
   }
-  const price = edit.variants?.[0]?.price;
-  if (price != null) {
-    parts.push(formatMoney(price, resolveCurrencyCode(edit.attributes)));
+  const prices = (edit.variants || [])
+    .map((item) => item.price)
+    .filter((price): price is number => typeof price === "number" && Number.isFinite(price));
+  if (prices.length) {
+    const code = resolveCurrencyCode(edit.attributes);
+    const min = Math.min(...prices.map(Number));
+    const max = Math.max(...prices.map(Number));
+    parts.push(min === max ? formatMoney(min, code) : `${formatMoney(min, code)}–${formatMoney(max, code)}`);
   }
   parts.push(`${edit.variants?.length || 0} SKU`);
   return parts.join(" · ");
 }
 
 export function resolvePublishTaskImage(task: OzonPublishTask): string | null {
-  if (task.main_image_url) return task.main_image_url;
   const images = task.edit_images;
   if (Array.isArray(images)) {
     const first = images.find((url) => typeof url === "string" && url.trim());
     if (first) return first;
   }
-  return null;
+  return task.main_image_url || null;
 }

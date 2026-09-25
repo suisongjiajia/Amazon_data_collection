@@ -19,11 +19,13 @@ from schemas import (
     ProductEditVariantUpdateRequest,
     PublishTaskCreateRequest,
     ReviewDecisionRequest,
+    ReviewContentUpdateRequest,
     ReviewPriceUpdateRequest,
     SelectionCreateRequest,
     SelectionVariantScopeUpdateRequest,
     ShopPipelineStartRequest,
     ShopPipelineFromCollectionRequest,
+    Alibaba1688ShopCollectRequest,
     SourcingSearchRequest,
 )
 from services import catalog_service, collection_service, draft_service, publish_service
@@ -255,13 +257,40 @@ def collect_ozon_shop_popular(request: ShopPipelineStartRequest) -> dict[str, An
     )
 
 
-@router.post("/shop-pipeline/start")
-def start_shop_pipeline(request: ShopPipelineStartRequest) -> dict[str, Any]:
+@router.post("/1688/shop-collect")
+def collect_1688_shop(request: Alibaba1688ShopCollectRequest) -> dict[str, Any]:
+    """采集 1688 整店 Top N（CDP），入库 platform=1688。"""
+    from services import alibaba1688_collection_service
+
     return handle_api_errors(
-        lambda: shop_pipeline_service.start_shop_pipeline(
+        lambda: alibaba1688_collection_service.run_1688_shop_collection(
             request.shop_url,
             top_n=request.top_n,
         ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/shop-pipeline/start")
+def start_shop_pipeline(request: ShopPipelineStartRequest) -> dict[str, Any]:
+    from collector.alibaba1688.url_parser import is_1688_shop_url
+    from services import alibaba1688_collection_service
+
+    def _run() -> dict[str, Any]:
+        # 1688 整店：先只做采集入库；Ozon 类目/上架流水线后续再接
+        if is_1688_shop_url(request.shop_url):
+            return alibaba1688_collection_service.run_1688_shop_collection(
+                request.shop_url,
+                top_n=request.top_n,
+            )
+        return shop_pipeline_service.start_shop_pipeline(
+            request.shop_url,
+            top_n=request.top_n,
+        )
+
+    return handle_api_errors(
+        _run,
         value_error_status=400,
         runtime_error_status=502,
     )
@@ -307,6 +336,14 @@ def retry_shop_pipeline_item(item_id: int) -> dict[str, Any]:
         lambda: shop_pipeline_service.retry_item(item_id),
         value_error_status=400,
         runtime_error_status=502,
+    )
+
+
+@router.delete("/shop-pipeline/items/{item_id}")
+def delete_shop_pipeline_item(item_id: int) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: shop_pipeline_service.delete_item(item_id),
+        value_error_status=404,
     )
 
 
@@ -600,6 +637,26 @@ def update_review_prices(edit_id: int, request: ReviewPriceUpdateRequest) -> dic
                 if request.variant_prices
                 else None
             ),
+        ),
+        value_error_status=400,
+    )
+
+
+@router.patch("/reviews/{edit_id}/content")
+def update_review_content(edit_id: int, request: ReviewContentUpdateRequest) -> dict[str, Any]:
+    return handle_api_errors(
+        lambda: review_service.update_content(
+            edit_id,
+            depth_mm=request.depth_mm,
+            width_mm=request.width_mm,
+            height_mm=request.height_mm,
+            weight_g=request.weight_g,
+            net_depth_mm=request.net_depth_mm,
+            net_width_mm=request.net_width_mm,
+            net_height_mm=request.net_height_mm,
+            images=request.images,
+            variant_aspect=request.variant_aspect,
+            variants=[item.model_dump() for item in request.variants] if request.variants else None,
         ),
         value_error_status=400,
     )

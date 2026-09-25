@@ -33,7 +33,7 @@ title, description, bullet_points, attributes, variants（含 sku/title/price/qu
 3. 字典属性错误（«все возможные значения собраны в виде списка» / Рецепт 等）：
    - 不要手填自由文本；改成该类目常见俄语字典选项，或删除该属性键让系统跳过。
    - 不确定时删除报错提到的属性键，不要瞎编。
-4. 旧价 old_price 由系统按售价×1.2 生成，你只需保证 variants[].price > 0。
+4. 旧价 old_price 由系统按售价×1.3 生成，你只需保证 variants[].price > 0。
 5. variants[].quantity 必须保持原值或使用较大正整数（如 99），禁止改成 0/1/2 等过小库存。
 6. 标题/描述保持俄语；不要编造违法信息。
 """
@@ -205,24 +205,18 @@ def _poll_and_handle(task_id: int, edit_id: int) -> None:
         # 仅「可售/上架成功」才算完成；pushed = 已创建但仍不可售，必须继续跟进
         if status in {"listed", "success", "completed"}:
             score = _read_task_content_score(task)
-            if pipeline_item and score is not None:
-                update_pipeline_item(int(pipeline_item["id"]), content_score=score)
-            if score is not None and score < _content_score_min():
-                _regenerate_for_low_score(edit_id, score)
-                if pipeline_item:
-                    update_pipeline_item(
-                        int(pipeline_item["id"]),
-                        status="pending_review",
-                        content_score=score,
-                        error_message=f"内容评分 {score} < {_content_score_min()}，已重生并退回审核",
-                    )
-                return
             if pipeline_item:
                 update_pipeline_item(
                     int(pipeline_item["id"]),
                     status="published",
                     publish_task_id=task_id,
-                    clear_error=True,
+                    content_score=score,
+                    clear_error=score is None or score >= _content_score_min(),
+                    error_message=(
+                        None
+                        if score is None or score >= _content_score_min()
+                        else f"已上架，内容评分 {score} 偏低，可在审核中心改文案后更新"
+                    ),
                 )
             return
 

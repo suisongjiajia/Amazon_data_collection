@@ -25,7 +25,7 @@ const STATUS_MAP: Record<string, StatusMeta> = {
   draft: { label: "草稿", tone: "muted" },
   awaiting_pull: { label: "待拉取", tone: "info" },
   submitted: { label: "已提交", tone: "info" },
-  pushed: { label: "已推送", tone: "warning" },
+  paused: { label: "已停售", tone: "muted" },
   partial: { label: "部分完成", tone: "warning" },
   publishing: { label: "发布中", tone: "info" },
   // 流水线失败分类（不是推送失败）

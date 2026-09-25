@@ -38,9 +38,17 @@ def get_fixed_package_metrics() -> tuple[int, int, int, int]:
     )
 
 
+def package_is_manual(attributes: dict[str, Any] | None) -> bool:
+    """审核中心手改过尺寸后，不再被全局默认值覆盖。"""
+    flag = str((attributes or {}).get("package_manual") or "").strip().lower()
+    return flag in {"1", "true", "yes", "on"}
+
+
 def apply_fixed_package_attributes(attributes: dict[str, Any] | None) -> dict[str, Any]:
-    """把统一尺寸/重量写入 attributes（覆盖原值）。"""
+    """把统一尺寸/重量写入 attributes（覆盖原值）。手改过的保留。"""
     attrs = dict(attributes or {})
+    if package_is_manual(attrs):
+        return attrs
     depth, width, height, weight = get_fixed_package_metrics()
     attrs["Длина, мм"] = str(depth)
     attrs["Ширина, мм"] = str(width)
@@ -69,9 +77,16 @@ def _parse_dimension_mm(value: Any) -> int | None:
     if not match:
         return None
     try:
-        return int(float(match.group(1).replace(",", ".")))
+        number = float(match.group(1).replace(",", "."))
     except ValueError:
         return None
+    lower = text.lower()
+    # 「85 см」是厘米，不能直接当成 85 毫米
+    if any(unit in lower for unit in ("см", "cm", "厘米")) and not any(
+        unit in lower for unit in ("мм", "mm", "毫米")
+    ):
+        number *= 10
+    return int(number)
 
 
 def parse_size_triplet_mm(value: Any) -> tuple[int | None, int | None, int | None]:
@@ -95,8 +110,23 @@ def parse_size_triplet_mm(value: Any) -> tuple[int | None, int | None, int | Non
         return nums[0], nums[1], nums[2]
     if len(nums) == 2:
         return nums[0], nums[1], nums[0]
-    if len(nums) == 1:
-        return nums[0], nums[0], nums[0]
+    return None, None, None
+
+
+def _is_net_product_key(key: str) -> bool:
+    """净品尺寸不能被当成包裹长宽高。"""
+    text = str(key)
+    lower = text.lower()
+    return lower.startswith("net_") or "净品" in text or "товара" in lower or "изделия" in lower
+
+
+def read_net_product_mm(attributes: dict[str, Any] | None) -> tuple[int | None, int | None, int | None]:
+    attrs = attributes or {}
+    depth = _parse_dimension_mm(attrs.get("net_depth_mm"))
+    width = _parse_dimension_mm(attrs.get("net_width_mm"))
+    height = _parse_dimension_mm(attrs.get("net_height_mm"))
+    if depth and width and height:
+        return depth, width, height
     return None, None, None
 
 
@@ -105,6 +135,8 @@ def _parse_dimensions_from_attributes(attributes: dict[str, Any]) -> tuple[int |
     width = None
     height = None
     for key, value in attributes.items():
+        if _is_net_product_key(str(key)) or not _is_explicit_package_key(str(key)):
+            continue
         lower = str(key).lower()
         # 组合尺寸字段（如 Размеры, мм=360*360）优先拆分
         if any(alias in lower for alias in ("размер", "size", "尺寸", "габарит")) and not any(
@@ -162,12 +194,53 @@ def _parse_weight_grams(attributes: dict[str, Any], size_weight: str | None = No
 def read_package_metrics(
     attributes: dict[str, Any],
 ) -> tuple[int | None, int | None, int | None, int | None]:
-    """读取包裹尺寸/重量；开启强制模式时一律返回统一尺寸。"""
-    if force_package_metrics_enabled():
+    """读取包裹尺寸/重量。未手改时用统一尺寸；手改后若和重量对不上，仍回落到统一尺寸。"""
+    if force_package_metrics_enabled() and not package_is_manual(attributes):
         return get_fixed_package_metrics()
     depth, width, height = _parse_dimensions_from_attributes(attributes)
     weight = _parse_weight_grams(attributes)
+    if force_package_metrics_enabled() and not _package_metrics_usable(depth, width, height, weight):
+        return get_fixed_package_metrics()
     return depth, width, height, weight
+
+
+def _is_explicit_package_key(key: str) -> bool:
+    """只有明确的包装尺寸字段才能覆盖长宽高，商品特征里的「85 厘米」不行。"""
+    text = str(key)
+    if _is_net_product_key(text):
+        return False
+    lower = text.lower()
+    if any(unit in lower for unit in ("см", "cm", "厘米")) and not any(
+        unit in lower for unit in ("мм", "mm", "毫米")
+    ):
+        return False
+    return any(
+        alias in lower
+        for alias in (
+            "размер",
+            "size",
+            "尺寸",
+            "длина",
+            "ширина",
+            "высота",
+            "length",
+            "width",
+            "height",
+            "depth",
+            "габарит",
+        )
+    )
+
+
+def _package_metrics_usable(
+    depth: int | None,
+    width: int | None,
+    height: int | None,
+    weight: int | None,
+) -> bool:
+    if not depth or not width or not height or not weight:
+        return False
+    return _package_density_issue(int(depth), int(width), int(height), int(weight)) is None
 
 
 def read_variant_package_metrics(
@@ -175,21 +248,21 @@ def read_variant_package_metrics(
     variant: dict[str, Any] | None = None,
 ) -> tuple[int | None, int | None, int | None, int | None]:
     """
-    优先用变体自身规格（如 Размеры, мм）覆盖包裹长宽高；重量仍取编辑属性。
-    强制模式下所有变体统一尺寸。
+    包裹尺寸以编辑属性为准。
+    变体标题里的「85 см」和袖长这类特征不能写成包装毫米。
     """
-    if force_package_metrics_enabled():
+    if force_package_metrics_enabled() and not package_is_manual(edit_attributes):
         return get_fixed_package_metrics()
     base_depth, base_width, base_height, weight = read_package_metrics(edit_attributes or {})
+    if package_is_manual(edit_attributes) or force_package_metrics_enabled():
+        return base_depth, base_width, base_height, weight
+
     variant = variant or {}
     merged: dict[str, Any] = {}
     for key, value in (variant.get("variant_attributes") or {}).items():
-        if value is not None and str(value).strip():
-            merged[str(key)] = value
-    # 变体标题里偶发带尺寸时也可兜底
-    title = variant.get("title")
-    if title and not any("размер" in str(k).lower() for k in merged):
-        merged.setdefault("size", title)
+        if value is None or not str(value).strip() or not _is_explicit_package_key(str(key)):
+            continue
+        merged[str(key)] = value
 
     v_depth, v_width, v_height = _parse_dimensions_from_attributes(merged)
     return (
@@ -329,23 +402,41 @@ def collect_listing_issues(edit: dict[str, Any]) -> list[dict[str, Any]]:
     """软校验上架 Listing，返回 issues（error / warning）。"""
     issues: list[dict[str, Any]] = []
     attributes = edit.get("attributes") or {}
-    images = [url for url in (edit.get("images") or []) if isinstance(url, str) and url.strip()]
 
     if not str(edit.get("title") or "").strip():
         issues.append({"code": "MISSING_TITLE", "severity": "error", "message": "缺少标题"})
     if not _composed_description(edit):
         issues.append({"code": "MISSING_DESCRIPTION", "severity": "warning", "message": "描述为空，建议补充"})
 
-    # 强制：1 张主图 + 4 张附图，否则不可生成 Listing / 不可推送
+    # 每个变体是独立 listing：各自需要 1 主图 + 4 附图
     required_images = 5
-    if len(images) < required_images:
+    variants = edit.get("variants") or []
+    product_images = [url for url in (edit.get("images") or []) if isinstance(url, str) and url.strip()]
+    if variants:
+        for variant in variants:
+            sku = str(variant.get("sku") or "").strip() or "?"
+            own = _variant_own_images(variant)
+            # 旧数据尚未写入变体图集时，暂用商品级图兜底计数
+            count = len(own) if own else len(product_images)
+            if count < required_images:
+                issues.append(
+                    {
+                        "code": "INSUFFICIENT_IMAGES",
+                        "severity": "error",
+                        "message": (
+                            f"变体 {sku} 图片不足：该 listing 需要 1 张主图 + 4 张附图"
+                            f"（共 {required_images} 张），当前 {count} 张"
+                        ),
+                    }
+                )
+    elif len(product_images) < required_images:
         issues.append(
             {
                 "code": "INSUFFICIENT_IMAGES",
                 "severity": "error",
                 "message": (
                     f"图片不足：需要 1 张主图 + 4 张附图（共 {required_images} 张），"
-                    f"当前仅 {len(images)} 张。请在商品编辑中补齐后再推送"
+                    f"当前仅 {len(product_images)} 张。请在商品编辑中补齐后再推送"
                 ),
             }
         )
@@ -371,7 +462,6 @@ def collect_listing_issues(edit: dict[str, Any]) -> list[dict[str, Any]]:
             }
         )
 
-    variants = edit.get("variants") or []
     usable = 0
     for variant in variants:
         sku = str(variant.get("sku") or "").strip()
@@ -448,13 +538,9 @@ def _normalize_listing_image_url(url: str) -> str:
     return text
 
 
-def _build_shared_listing_images(edit: dict[str, Any], base_images: list[str]) -> list[str]:
-    """
-    多变体共用同一套完整图库。
-    Ozon 合卡后每个尺码/SKU 各自展示 images；若只给某个变体 1 张封面，
-    切换尺码就会只剩一张图。
-    """
-    pool: list[str] = []
+def _variant_own_images(variant: dict[str, Any]) -> list[str]:
+    """该变体自己的 listing 图集：主图 + 副图，不含商品级共用图。"""
+    ordered: list[str] = []
     seen: set[str] = set()
 
     def _add(raw: Any) -> None:
@@ -465,27 +551,43 @@ def _build_shared_listing_images(edit: dict[str, Any], base_images: list[str]) -
         if lower.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx")):
             return
         seen.add(url)
-        pool.append(url)
+        ordered.append(url)
 
-    for url in base_images:
-        _add(url)
-    for variant in edit.get("variants") or []:
-        _add(variant.get("image_url"))
-        va = variant.get("variant_attributes") if isinstance(variant.get("variant_attributes"), dict) else {}
-        for key in ("image", "image_url", "主图"):
-            _add(va.get(key))
+    va = variant.get("variant_attributes") if isinstance(variant.get("variant_attributes"), dict) else {}
+    _add(variant.get("image_url"))
+    for key in ("image", "image_url", "主图"):
+        _add(va.get(key))
+    extra = va.get("images")
+    if isinstance(extra, list):
+        for item in extra:
+            _add(item)
+    return ordered[:15]
 
-    return _prefer_reachable_listing_images(pool)[:15]
+
+def _build_variant_listing_images(variant: dict[str, Any], fallback_images: list[str] | None = None) -> list[str]:
+    """
+    每个变体对应一个独立 listing：只用自己的主图+副图。
+    旧数据若尚未写入变体图集，才回退到商品级 images。
+    """
+    ordered = _variant_own_images(variant)
+    if ordered:
+        return ordered
+    fallback: list[str] = []
+    seen: set[str] = set()
+    for raw in fallback_images or []:
+        url = _normalize_listing_image_url(str(raw or ""))
+        if not url or url in seen:
+            continue
+        lower = url.lower()
+        if lower.endswith((".pdf", ".doc", ".docx", ".xls", ".xlsx")):
+            continue
+        seen.add(url)
+        fallback.append(url)
+    return fallback[:15]
 
 
 def _prefer_reachable_listing_images(urls: list[str]) -> list[str]:
-    """
-    清洗上架图片：
-    - 去掉 PDF 等非图片链接（易触发「根据链接找不到文件」）
-    - 放大 wc140 缩略图
-    - 已转存 OSS 的完整图库优先保留（勿因 1 张变体 Ozon CDN 封面丢掉整库）
-    - 否则再优先 Ozon CDN，并保留其余链接
-    """
+    """清洗上架图片，保持传入顺序。"""
     cleaned: list[str] = []
     seen: set[str] = set()
     for raw in urls:
@@ -499,22 +601,45 @@ def _prefer_reachable_listing_images(urls: list[str]) -> list[str]:
             continue
         seen.add(url)
         cleaned.append(url)
-
-    oss = [u for u in cleaned if "aliyuncs.com" in u.lower()]
-    ozon_cdn = [
-        u
-        for u in cleaned
-        if ("ozon" in u.lower() or "ozone.ru" in u.lower() or "ozonusercontent" in u.lower())
-        and "aliyuncs.com" not in u.lower()
-    ]
-    # 转存后图库通常 ≥5 张 OSS：整库保留，变体 Ozon 封面仅作补充
-    if len(oss) >= 5:
-        rest = [u for u in cleaned if u not in oss]
-        return (oss + rest)[:15]
-    if ozon_cdn:
-        rest = [u for u in cleaned if u not in ozon_cdn]
-        return (ozon_cdn + rest)[:15]
     return cleaned[:15]
+
+
+def _colors_for_merged_card(
+    variants: list[dict[str, Any]],
+    attributes: dict[str, Any],
+    edit: dict[str, Any],
+) -> dict[str, str]:
+    """合卡前先算每个变体的颜色。同色时用标题里独有的规格分开，避免可变特性完全一样。"""
+    from services.ozon_attribute_fill import disambiguate_variant_colors, listing_color_label
+
+    if str(attributes.get("variant_aspect") or "") == "size":
+        return {}
+    pending: list[tuple[str, str, str]] = []
+    for variant in variants:
+        sku = str(variant.get("sku") or "").strip()
+        va = variant.get("variant_attributes") or {}
+        existing_color = str(
+            va.get("Цвет товара") or va.get("Цвет") or va.get("Название цвета") or ""
+        ).strip()
+        color = listing_color_label(
+            existing_color,
+            variant.get("title"),
+            variant.get("url"),
+            edit.get("title"),
+        )
+        if not color:
+            blob = " ".join(
+                str(x or "")
+                for x in (
+                    variant.get("title"),
+                    edit.get("title"),
+                    attributes.get("Материал"),
+                )
+            ).lower()
+            if any(token in blob for token in ("брезент", "tarpaulin", "canvas", "утеплен")):
+                color = "серый"
+        pending.append((sku, color, str(variant.get("title") or "")))
+    return disambiguate_variant_colors(pending)
 
 
 def build_import_items(
@@ -522,7 +647,6 @@ def build_import_items(
     *,
     warnings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    images = [url for url in (edit.get("images") or []) if isinstance(url, str) and url.strip()]
     attributes = edit.get("attributes") or {}
 
     description_category_id = _as_int_id(
@@ -547,7 +671,8 @@ def build_import_items(
     from services.ozon_attribute_fill import (
         apply_variant_distinguishing_attributes,
         build_ozon_attribute_values,
-        infer_color_label,
+        contains_cjk,
+        strip_cjk,
     )
 
     ozon_attrs, missing_required = build_ozon_attribute_values(
@@ -584,23 +709,16 @@ def build_import_items(
         )
 
     items: list[dict[str, Any]] = []
-    # 所有尺码/SKU 共用完整图库，避免合卡后切换变体只剩一张图
-    shared_images = _build_shared_listing_images(edit, images)
-    # 多变体合卡：共用型号名；颜色/尺码与包裹尺寸按变体覆盖
+    fallback_images = [url for url in (edit.get("images") or []) if isinstance(url, str) and url.strip()]
+    color_by_sku = _colors_for_merged_card(variants, attributes, edit)
+    # 多变体合卡：每个 offer 仍是独立 listing，图集互不共用
     for variant in variants:
         sku = str(variant.get("sku") or "").strip()
         price = variant.get("price")
         if price is None:
             raise OzonSellerError(f"变体 {sku} 缺少价格，请先填写价格后再发布")
         depth, width, height, weight = read_variant_package_metrics(attributes, variant)
-        item_images = list(shared_images)
-        variant_image = _normalize_listing_image_url(str(variant.get("image_url") or ""))
-        # 仅调整主图顺序：变体封面若已在图库中则置顶；绝不把整库替换成单张封面
-        if variant_image and variant_image in item_images:
-            item_images = [variant_image] + [u for u in item_images if u != variant_image]
-        elif variant_image and len(item_images) < 5:
-            item_images = [variant_image] + item_images
-            item_images = item_images[:15]
+        item_images = _build_variant_listing_images(variant, fallback_images)
         # 把变体尺寸/重量写入区分属性（供 Ozon 特征表展示）
         va = dict(variant.get("variant_attributes") or {})
         if depth is not None and width is not None and height is not None:
@@ -608,53 +726,46 @@ def build_import_items(
             va["Размер упаковки (Длина х Ширина х Высота), см"] = (
                 f"{max(1, round(depth / 10))}x{max(1, round(width / 10))}x{max(1, round(height / 10))}"
             )
+        net_depth, net_width, net_height = read_net_product_mm(va)
+        if not (net_depth and net_width and net_height):
+            net_depth, net_width, net_height = read_net_product_mm(attributes)
+        if net_depth and net_width and net_height:
+            net_text = f"{net_depth}*{net_width}*{net_height}"
+            va["Размеры, мм"] = net_text
+            va["Размеры товара, мм"] = net_text
         if weight is not None:
             va.setdefault("Вес товара, г", str(int(weight)))
             va.setdefault("Вес с упаковкой, г", str(int(weight)))
-        # 优先保留变体已有颜色；否则从标题/链接推断；帆布类默认灰色
-        junk_colors = {"уточняйте у продавца", "ask seller", "зеленый", "зелёный", ""}
-        existing_color = str(
-            va.get("Цвет товара") or va.get("Цвет") or va.get("Название цвета") or ""
-        ).strip()
-        color = existing_color if existing_color.lower() not in junk_colors else ""
-        if not color:
-            color = infer_color_label(
-                variant.get("title"),
-                variant.get("url"),
-            ) or ""
-        if not color:
-            blob = " ".join(
-                str(x or "")
-                for x in (
-                    variant.get("title"),
-                    edit.get("title"),
-                    attributes.get("Материал"),
-                )
-            ).lower()
-            if any(x in blob for x in ("брезент", "tarpaulin", "canvas", "утеплен")):
-                color = "серый"
-        if color:
-            va["Цвет"] = color
-            va["Цвет товара"] = color
-            va["Название цвета"] = color
+        if str(attributes.get("variant_aspect") or "") == "size":
+            for key in ("Цвет", "Цвет товара", "Название цвета"):
+                va.pop(key, None)
+        else:
+            color = color_by_sku.get(sku) or ""
+            if color:
+                va["Цвет"] = color
+                va["Цвет товара"] = color
+                va["Название цвета"] = color
         variant_attrs = apply_variant_distinguishing_attributes(
             ozon_attrs,
             description_category_id=description_category_id,
             type_id=type_id,
             variant_attributes=va,
             edit_title=str(variant.get("title") or edit.get("title") or ""),
+            variant_aspect=str(attributes.get("variant_aspect") or "color"),
         )
         price_num = float(price)
-        old_price_num = round(price_num * 1.2, 2)
+        old_price_num = round(price_num * 1.3, 2)
         if float(old_price_num).is_integer():
             old_price_str = str(int(old_price_num))
         else:
             old_price_str = str(old_price_num)
         price_str = str(int(price_num) if float(price_num).is_integer() else price_num)
+        name = strip_cjk(variant.get("title") or edit.get("title") or "") or sku
+        item_description = strip_cjk(description) if contains_cjk(description) else description
         item: dict[str, Any] = {
             "offer_id": sku,
-            "name": str(variant.get("title") or edit.get("title") or sku),
-            "description": description,
+            "name": name,
+            "description": item_description,
             "description_category_id": description_category_id,
             "type_id": type_id,
             "price": price_str,

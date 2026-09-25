@@ -220,6 +220,129 @@ def update_pipeline_item(
     return get_pipeline_item(item_id)
 
 
+def sync_pipeline_item_for_edit(
+    edit_id: int,
+    *,
+    publish_status: str,
+    publish_task_id: int | None = None,
+    error_message: str | None = None,
+) -> None:
+    """发布任务状态变化时，立刻回写流水线，避免一直停在待审核。"""
+    item = find_pipeline_item_by_edit(edit_id)
+    if item is None:
+        return
+    current = str(item.get("status") or "")
+    if current in {"queued", "collecting", "sourcing", "editing", "listing", "processing"}:
+        return
+    status = str(publish_status or "")
+    if status in {"listed", "completed", "success"}:
+        update_pipeline_item(
+            int(item["id"]),
+            status="published",
+            publish_task_id=publish_task_id,
+            clear_error=True,
+        )
+        recount_pipeline_job(int(item["job_id"]))
+        return
+    if status == "failed" and current != "published":
+        update_pipeline_item(
+            int(item["id"]),
+            status="publish_failed",
+            publish_task_id=publish_task_id,
+            error_message=error_message or "发布失败",
+        )
+        recount_pipeline_job(int(item["job_id"]))
+
+
+def sync_pipeline_items_for_review(edit_id: int, *, result: str, note: str | None = None) -> int:
+    """审核通过/驳回后，把关联流水线明细状态一并改掉（同一 edit 可能有多条历史明细）。"""
+    rows = fetch_all(
+        """
+        SELECT id, job_id, status
+        FROM shop_pipeline_item
+        WHERE edit_id = %s
+        """,
+        (edit_id,),
+    )
+    if not rows:
+        return 0
+    target = "approved" if result == "approved" else "rejected"
+    touched_jobs: set[int] = set()
+    changed = 0
+    for row in rows:
+        current = str(row.get("status") or "")
+        if current in {"published", "publishing"}:
+            continue
+        if current == target:
+            continue
+        update_pipeline_item(
+            int(row["id"]),
+            status=target,
+            error_message=(note[:500] if note and target == "rejected" else None),
+            clear_error=(target == "approved"),
+        )
+        touched_jobs.add(int(row["job_id"]))
+        changed += 1
+    for job_id in touched_jobs:
+        recount_pipeline_job(job_id)
+    return changed
+
+
+def reconcile_pipeline_jobs() -> int:
+    """把已经上架成功、但流水线仍显示待审核/失败的明细纠正过来；并同步已驳回的编辑。"""
+    with get_connection(dict_cursor=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                UPDATE shop_pipeline_item i
+                JOIN product_edit pe ON pe.id = i.edit_id
+                SET i.status = 'published',
+                    i.error_message = NULL
+                WHERE i.status NOT IN (
+                    'published', 'queued', 'collecting', 'sourcing',
+                    'editing', 'listing', 'processing'
+                )
+                  AND (
+                    pe.status = 'published'
+                    OR EXISTS (
+                        SELECT 1 FROM ozon_publish_task t
+                        WHERE t.edit_id = i.edit_id
+                          AND t.status IN ('listed', 'completed')
+                    )
+                  )
+                """
+            )
+            changed = int(cursor.rowcount or 0)
+            cursor.execute(
+                """
+                UPDATE shop_pipeline_item i
+                JOIN product_edit pe ON pe.id = i.edit_id
+                SET i.status = 'rejected'
+                WHERE pe.status = 'rejected'
+                  AND i.status NOT IN (
+                    'published', 'publishing', 'rejected',
+                    'queued', 'collecting', 'sourcing', 'editing', 'listing', 'processing'
+                  )
+                """
+            )
+            changed += int(cursor.rowcount or 0)
+            cursor.execute(
+                """
+                UPDATE shop_pipeline_item i
+                JOIN product_edit pe ON pe.id = i.edit_id
+                SET i.status = 'approved'
+                WHERE pe.status = 'approved'
+                  AND i.status IN ('pending_review', 'needs_fix', 'listing_failed')
+                """
+            )
+            changed += int(cursor.rowcount or 0)
+            cursor.execute("SELECT DISTINCT job_id FROM shop_pipeline_item")
+            job_ids = [int(row["job_id"]) for row in cursor.fetchall()]
+    for job_id in job_ids:
+        recount_pipeline_job(job_id)
+    return changed
+
+
 def find_pipeline_item_by_edit(edit_id: int) -> dict[str, Any] | None:
     return fetch_one(
         """
@@ -237,9 +360,43 @@ def find_pipeline_item_by_edit(edit_id: int) -> dict[str, Any] | None:
     )
 
 
+def delete_pipeline_item(item_id: int) -> dict[str, Any]:
+    """从流水线任务中移除一条明细。未发布的草稿一并删掉，避免还留在审核中心。"""
+    item = get_pipeline_item(item_id)
+    job_id = int(item["job_id"])
+    edit_id = item.get("edit_id")
+    with get_connection(dict_cursor=True) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM shop_pipeline_item WHERE id = %s", (item_id,))
+            if edit_id:
+                cursor.execute(
+                    "SELECT COUNT(*) AS n FROM ozon_publish_task WHERE edit_id = %s",
+                    (int(edit_id),),
+                )
+                published = int((cursor.fetchone() or {}).get("n") or 0)
+                cursor.execute(
+                    "SELECT status FROM product_edit WHERE id = %s",
+                    (int(edit_id),),
+                )
+                edit_row = cursor.fetchone() or {}
+                status = str(edit_row.get("status") or "")
+                if published == 0 and status in {
+                    "draft",
+                    "editing",
+                    "listing_ready",
+                    "pending_review",
+                    "needs_fix",
+                    "rejected",
+                }:
+                    cursor.execute("DELETE FROM review_record WHERE edit_id = %s", (int(edit_id),))
+                    cursor.execute("DELETE FROM product_edit WHERE id = %s", (int(edit_id),))
+    job = recount_pipeline_job(job_id)
+    return {"id": item_id, "deleted": True, "job": job}
+
+
 def recount_pipeline_job(job_id: int) -> dict[str, Any]:
     items = list_pipeline_items(job_id)
-    success_statuses = {"pending_review", "approved", "publishing", "published"}
+    success_statuses = {"approved", "publishing", "published"}
     fail_statuses = {
         "failed",
         "attr_missing",

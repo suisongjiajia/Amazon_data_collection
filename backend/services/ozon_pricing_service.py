@@ -9,8 +9,8 @@ from db.ozon_workflow import list_supplier_candidates
 from services.sourcing_service import _enrich_ozon_family_for_display
 from services.xingyuan_freight import FreightError, calc_xingyuan_economy_freight_cny
 
-# 理解 A：P = (G + F) × 1.30 / (1 - 0.20) = (G + F) × 1.625
-DEFAULT_COMMISSION_RATE = 0.20
+# 理解 A：P = (G + F) × 1.30 / (1 - 0.30) = (G + F) × (1.30/0.70) ≈ (G + F) × 1.857
+DEFAULT_COMMISSION_RATE = 0.30
 DEFAULT_PROFIT_MARKUP = 1.30
 DEFAULT_STOCK_QTY = 99
 
@@ -41,11 +41,12 @@ def parse_cny_price(value: Any) -> float | None:
     if isinstance(value, (int, float)):
         return float(value) if float(value) > 0 else None
     text = str(value)
-    digits = re.sub(r"[^\d.,]", "", text).replace(",", ".")
-    if not digits:
+    # 区间价取第一个有效数字（如 ¥5.50-¥8.80 → 5.50）
+    match = re.search(r"(\d+(?:[.,]\d+)?)", text.replace(",", "."))
+    if not match:
         return None
     try:
-        amount = float(digits)
+        amount = float(match.group(1).replace(",", "."))
     except ValueError:
         return None
     return amount if amount > 0 else None
@@ -87,8 +88,16 @@ def calc_suggested_price_rub(
     if freight_cny < 0:
         raise ValueError("运费不能为负")
 
-    commission = DEFAULT_COMMISSION_RATE if commission_rate is None else float(commission_rate)
-    markup = DEFAULT_PROFIT_MARKUP if profit_markup is None else float(profit_markup)
+    commission = (
+        _env_float("OZON_COMMISSION_RATE", DEFAULT_COMMISSION_RATE)
+        if commission_rate is None
+        else float(commission_rate)
+    )
+    markup = (
+        _env_float("OZON_PROFIT_MARKUP", DEFAULT_PROFIT_MARKUP)
+        if profit_markup is None
+        else float(profit_markup)
+    )
     fx = _env_float("OZON_RUB_PER_CNY", 12.0) if rub_per_cny is None else float(rub_per_cny)
     if commission >= 1:
         raise ValueError("佣金比例必须小于 1")
@@ -98,7 +107,7 @@ def calc_suggested_price_rub(
         raise ValueError("汇率 OZON_RUB_PER_CNY 必须大于 0")
 
     cost_cny = supplier_price_cny + freight_cny
-    # 理解 A：扣完 20% 佣金后，相对成本再赚 30%
+    # 理解 A：扣完佣金后，相对成本再赚 30%（默认佣金 30%）
     price_cny = cost_cny * markup / (1.0 - commission)
     price_rub = price_cny * fx
     price_cny_int = max(1, int(round(price_cny)))
@@ -131,6 +140,39 @@ def calc_suggested_price_rub(
     }
 
 
+def scale_list_price(base_price: int, reference: float | None, anchor_reference: float | None) -> int:
+    """按各规格在 Ozon 上的标价比例，把同一个成本价拉开。"""
+    if base_price <= 0:
+        return int(base_price)
+    if reference is None or anchor_reference is None or anchor_reference <= 0 or reference <= 0:
+        return int(base_price)
+    return max(1, int(round(base_price * (reference / anchor_reference))))
+
+
+def variant_prices_from_collected(
+    base_price: int,
+    variants: list[dict[str, Any]],
+    *,
+    anchor_external_id: str | None,
+) -> list[int]:
+    refs: list[float | None] = []
+    anchor: float | None = None
+    root_id = str(anchor_external_id or "").strip()
+    for variant in variants:
+        external_id = str(variant.get("external_id") or "").strip()
+        if not external_id:
+            sku = str(variant.get("sku") or "")
+            if sku.startswith("OZON-"):
+                external_id = sku[5:]
+        ref = parse_cny_price(variant.get("price_text") or variant.get("collected_price_text"))
+        refs.append(ref)
+        if root_id and external_id == root_id and ref:
+            anchor = ref
+    if anchor is None:
+        anchor = next((ref for ref in refs if ref), None)
+    return [scale_list_price(base_price, ref, anchor) for ref in refs]
+
+
 def _pick_supplier_price(candidates: list[dict[str, Any]]) -> tuple[float | None, dict[str, Any] | None]:
     selected = [item for item in candidates if item.get("status") == "selected"]
     pool = selected or candidates[:1]
@@ -149,17 +191,52 @@ def suggest_price_for_family(raw_product_family_id: int) -> dict[str, Any]:
     product = _enrich_ozon_family_for_display(family)
     candidates = list_supplier_candidates(raw_product_family_id, limit=20)
     supplier_price, supplier = _pick_supplier_price(candidates)
+    if supplier_price is None and str(family.get("platform") or "") == "1688":
+        # 1688 直采：用商品自身价格当货本
+        raw = family.get("raw_payload") if isinstance(family.get("raw_payload"), dict) else {}
+        supplier_price = parse_cny_price(raw.get("price_text"))
+        if supplier_price is None:
+            for variant in family.get("variants") or []:
+                supplier_price = parse_cny_price(variant.get("price_text"))
+                if supplier_price:
+                    break
+        supplier = {
+            "id": None,
+            "supplier_name": family.get("brand") or family.get("category_name"),
+            "product_title": family.get("title"),
+            "price_text": raw.get("price_text") or (family.get("variants") or [{}])[0].get("price_text"),
+            "status": "self_1688",
+        }
     if supplier_price is None:
         raise ValueError("缺少 1688 供应商价格，请先搜货并选定货源")
 
-    attributes = product.get("attributes") or {}
-    weight_g = parse_weight_grams(product.get("weight"), attributes)
-    if weight_g is None:
-        # 无重量时按 Extra Small 上限估算，避免无法定价；明细里会标明
-        weight_g = _env_float("OZON_DEFAULT_WEIGHT_G", 200.0)
-        weight_assumed = True
+    attributes = dict(product.get("attributes") or {})
+    # 1688：优先用详情包装表解析出的 package_metrics（取较重新，避免运费算少）
+    if str(family.get("platform") or "") == "1688":
+        raw = family.get("raw_payload") if isinstance(family.get("raw_payload"), dict) else {}
+        nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+        metrics = nested.get("package_metrics") if isinstance(nested.get("package_metrics"), dict) else {}
+        if not metrics and isinstance(raw.get("attributes"), dict):
+            attributes = {**attributes, **raw["attributes"]}
+        if metrics.get("weight_g"):
+            try:
+                weight_g = float(metrics["weight_g"])
+                weight_assumed = False
+            except (TypeError, ValueError):
+                weight_g = None
+                weight_assumed = True
+        else:
+            weight_g = parse_weight_grams(product.get("weight"), attributes)
+            weight_assumed = weight_g is None
+            if weight_g is None:
+                weight_g = _env_float("OZON_DEFAULT_WEIGHT_G", 200.0)
     else:
-        weight_assumed = False
+        weight_g = parse_weight_grams(product.get("weight"), attributes)
+        if weight_g is None:
+            weight_g = _env_float("OZON_DEFAULT_WEIGHT_G", 200.0)
+            weight_assumed = True
+        else:
+            weight_assumed = False
 
     try:
         freight_info = calc_xingyuan_economy_freight_cny(weight_g)

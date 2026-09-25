@@ -78,6 +78,11 @@ class ShopPipelineStartRequest(BaseModel):
     top_n: int | None = 50
 
 
+class Alibaba1688ShopCollectRequest(BaseModel):
+    shop_url: str
+    top_n: int | None = 50
+
+
 class ShopPipelineFromCollectionRequest(BaseModel):
     collection_task_id: int
     limit: int | None = None
@@ -118,6 +123,34 @@ class ReviewPriceUpdateRequest(BaseModel):
     """审核中改价：可按变体分别改，或填 apply_all_price 统一改所有变体。"""
     apply_all_price: float | None = None
     variant_prices: list[ReviewVariantPriceItem] | None = None
+
+
+class ReviewVariantEditItem(BaseModel):
+    variant_id: int
+    price: float | None = None
+    color: str | None = None
+    quantity: int | None = None
+    title: str | None = None
+    size: str | None = None
+    image_url: str | None = None
+    images: list[str] | None = None
+    net_depth_mm: int | None = None
+    net_width_mm: int | None = None
+    net_height_mm: int | None = None
+
+
+class ReviewContentUpdateRequest(BaseModel):
+    """审核中心直接改包裹尺寸、净品尺寸、颜色和价格。"""
+    depth_mm: int | None = None
+    width_mm: int | None = None
+    height_mm: int | None = None
+    weight_g: int | None = None
+    net_depth_mm: int | None = None
+    net_width_mm: int | None = None
+    net_height_mm: int | None = None
+    images: list[str] | None = None
+    variant_aspect: str | None = None
+    variants: list[ReviewVariantEditItem] | None = None
 
 
 class OzonPublishRequest(BaseModel):

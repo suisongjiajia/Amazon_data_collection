@@ -101,6 +101,41 @@ def parse_product_info_items(payload: dict[str, Any] | None) -> list[dict[str, A
     return []
 
 
+def is_seller_paused(product: dict[str, Any] | None) -> bool:
+    """卖家主动停售或归档。库存不足、还在创建（Не продается）不算停售。"""
+    if not isinstance(product, dict) or not product:
+        return False
+    if bool(product.get("is_archived") or product.get("archived")):
+        return True
+    statuses = product.get("statuses") if isinstance(product.get("statuses"), dict) else {}
+    status = str(statuses.get("status") or "").strip().lower()
+    if status in {"archived", "removed", "disabled"}:
+        return True
+    blob = " ".join(
+        str(statuses.get(key) or "")
+        for key in ("status_name", "status_description", "status_tooltip")
+    ).lower()
+    tokens = (
+        "removed_from_sale",
+        "снят",
+        "архив",
+        "停售",
+        "已下架",
+        "已归档",
+        "不出售",
+    )
+    return any(token in blob for token in tokens)
+
+
+def local_status_from_product(product: dict[str, Any] | None) -> tuple[str, str | None, str | None]:
+    """已有商品详情时的本地状态：listed / paused / pushed。"""
+    if is_seller_paused(product):
+        return "paused", "SELLER_PAUSED", "商品已在 Ozon，卖家已停售（不是上架失败）"
+    if is_ozon_product_sellable(product):
+        return "listed", None, None
+    return "pushed", "NOT_SELLABLE_YET", "商品已在 Ozon，但尚不可售（请确认库存/校验）"
+
+
 def is_ozon_product_sellable(product: dict[str, Any] | None) -> bool:
     """可售：已创建 SKU，且有库存（或可见性表明有货）。"""
     if not isinstance(product, dict) or not product:
@@ -153,6 +188,8 @@ def resolve_publish_item_status(
         return "awaiting_pull", None, None
 
     # imported
+    if product_info and is_seller_paused(product_info):
+        return "paused", "SELLER_PAUSED", "商品已在 Ozon，卖家已停售（不是上架失败）"
     if product_info and is_ozon_product_sellable(product_info):
         return "listed", None, None
 
@@ -218,6 +255,7 @@ def aggregate_task_status(item_statuses: list[str]) -> str:
             "processing": "awaiting_pull",
             "success": "listed",
             "completed": "listed",
+            "paused": "listed",
             "partial": "pushed",
         }.get(s, s)
         for s in normalized

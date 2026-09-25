@@ -9,21 +9,23 @@ from db.ozon_workflow import list_supplier_candidates
 from integrations.deepseek.client import DeepSeekClient, DeepSeekError
 from services.sourcing_service import _enrich_ozon_family_for_display
 
-SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的 Ozon 商品信息、规格、类目属性清单和 1688 货源，生成可直接用于 Ozon Seller API 上架的俄语商品内容。
+SYSTEM_PROMPT = """你是 Ozon 跨境电商 listing 专家。根据采集到的商品信息（可能来自 Ozon 对标品或 1688 货源）、规格、类目属性清单，生成可直接用于 Ozon Seller API 上架的俄语商品内容。
 
 要求：
 1. 标题、描述、卖点 bullet_points 使用俄语，符合 Ozon 规范，标题简洁有卖点（不超过 200 字符）。
 2. description 为纯文本，可包含换行，不要 HTML；建议 600～1500 字符，覆盖用途、材质、尺寸、场景、保养。
-3. bullet_points 5-8 条，突出材质、适用宠物、保暖/防水、尺寸、包装等。
+3. bullet_points 5-8 条，突出材质、适用对象、功能、尺寸、包装等。
 4. attributes 必须尽量填满 context.ozon_fillable_attributes 中的每一项：
    - 键名必须与清单中的俄语属性名完全一致（不要用中文键名）
    - 值为俄语或数字字符串；字典枚举类属性填常见俄语选项（如 Страна-изготовитель=Китай，Нужен код маркировки=Нет）
    - 重量相关用克（例如 Вес товара, г=500）；包装尺寸用厘米字符串如 36x36x36
-   - 件数/数量类默认 1；#Хештеги 用空格分隔的俄语标签；Аннотация 为 1～2 句简介
+   - 件数/数量类默认 1；#Хештеги 用空格分隔的俄语标签
+   - Аннотация 用完整俄语描述（用途、材质、尺寸、场景、保养），不要只写一两句
+   - Комплектация 按行写清每件包含物和数量，例如「Домик — 1 шт.」
    - 无法合理推断的属性可省略，不要编造危险/违法信息
 5. search_keywords 为俄语搜索词数组（8～15 个）。
 6. category_hint 为建议的 Ozon 类目路径（俄语或中文均可）。
-7. variants 数组：每个变体含 title（俄语，可带尺寸区分）。不要自行编造 price / quantity。
+7. variants 数组：每个变体含 title（俄语，可带尺寸/颜色区分）。不要自行编造 price / quantity。
 8. listing_notes 用中文简要说明文案注意点（不要写定价公式）。
 
 只输出 JSON 对象，不要 markdown，字段：
@@ -57,6 +59,7 @@ def _parse_price_number(value: Any) -> float | None:
 def _build_ai_context(raw_product_family_id: int) -> dict[str, Any]:
     family = get_ozon_product_family(raw_product_family_id)
     product = _enrich_ozon_family_for_display(family)
+    is_1688 = str(family.get("platform") or "") == "1688"
     candidates = list_supplier_candidates(raw_product_family_id, limit=20)
     selected = [item for item in candidates if item.get("status") == "selected"]
     supplier_pool = selected or candidates[:3]
@@ -73,30 +76,62 @@ def _build_ai_context(raw_product_family_id: int) -> dict[str, Any]:
                 "status": item.get("status"),
             }
         )
+    if is_1688 and not suppliers:
+        raw = family.get("raw_payload") if isinstance(family.get("raw_payload"), dict) else {}
+        suppliers.append(
+            {
+                "supplier_name": family.get("brand") or family.get("category_name"),
+                "product_title": family.get("title"),
+                "price_text": raw.get("price_text"),
+                "status": "self_1688",
+            }
+        )
 
     fillable_attributes = _load_fillable_attribute_names(
         product.get("description_category_id") or family.get("category_id"),
         product.get("type_id") or family.get("type_id"),
     )
 
+    source_images = list(product.get("images") or [])
+    if isinstance(family.get("raw_payload"), dict):
+        for url in (family.get("raw_payload") or {}).get("images") or []:
+            if isinstance(url, str) and url.startswith("http") and url not in source_images:
+                source_images.append(url)
+    if isinstance(family.get("bullet_points"), list):
+        for url in family.get("bullet_points") or []:
+            if isinstance(url, str) and url.startswith("http") and url not in source_images:
+                source_images.append(url)
+    if not source_images and family.get("main_image_url"):
+        source_images = [family.get("main_image_url")]
+
     return {
+        "source_platform": "1688" if is_1688 else "ozon",
         "ozon_product": {
             "external_id": product.get("external_id"),
             "title": product.get("title"),
             "brand": product.get("brand"),
             "category_name": product.get("category_name"),
-            "price_text": product.get("price_text"),
+            "price_text": product.get("price_text")
+            or (family.get("raw_payload") or {}).get("price_text")
+            if isinstance(family.get("raw_payload"), dict)
+            else product.get("price_text"),
             "description": product.get("description"),
             "size": product.get("size"),
             "weight": product.get("weight"),
-            "attributes": product.get("attributes") or {},
-            "images": product.get("images") or [],
-            "main_image_url": product.get("main_image_url"),
-            "description_category_id": product.get("description_category_id"),
-            "type_id": product.get("type_id"),
+            "attributes": product.get("attributes")
+            or (
+                (family.get("raw_payload") or {}).get("attributes")
+                if isinstance(family.get("raw_payload"), dict)
+                else {}
+            )
+            or {},
+            "images": source_images,
+            "main_image_url": product.get("main_image_url") or family.get("main_image_url"),
+            "description_category_id": product.get("description_category_id") or family.get("category_id"),
+            "type_id": product.get("type_id") or family.get("type_id"),
             "rating": product.get("rating"),
             "review_count": product.get("review_count"),
-            "source_url": product.get("source_url"),
+            "source_url": product.get("source_url") or family.get("source_url"),
             "variants": [
                 {
                     "external_id": v.get("external_id"),
@@ -141,7 +176,8 @@ def _normalize_ai_result(raw: dict[str, Any], context: dict[str, Any]) -> dict[s
 
     ozon = context.get("ozon_product") or {}
     external_id = ozon.get("external_id") or "sku"
-    default_sku = f"OZON-{external_id}"
+    source_platform = str(context.get("source_platform") or "ozon")
+    default_sku = f"A1688-{external_id}" if source_platform == "1688" else f"OZON-{external_id}"
     default_qty = DEFAULT_STOCK_QTY
 
     variants_raw = raw.get("variants")
@@ -246,10 +282,34 @@ def _apply_pricing_and_images(
 
     image_result: dict[str, Any] | None = None
     if rehost_images and suggestion.get("images"):
+        original_images = list(suggestion.get("images") or [])
         try:
             sku = (suggestion.get("variants") or [{}])[0].get("sku") or f"family-{raw_product_family_id}"
             image_result = rehost_image_urls(list(suggestion["images"]), sku=str(sku))
-            suggestion["images"] = image_result["images"]
+            hosted = list(image_result.get("images") or [])
+            # 转存后若图变少，用原图补齐，避免 listing 因图不够卡死
+            if len(hosted) < 5 and len(original_images) > len(hosted):
+                for url in original_images:
+                    if url not in hosted:
+                        hosted.append(url)
+                    if len(hosted) >= 10:
+                        break
+            suggestion["images"] = hosted
+            # 每个变体独立 listing：写入各自主图+副图（主图优先）
+            for variant in suggestion.get("variants") or []:
+                primary = str(variant.get("image_url") or variant.get("main_image_url") or "").strip()
+                own: list[str] = []
+                if primary:
+                    own.append(primary)
+                for url in hosted:
+                    if url not in own:
+                        own.append(url)
+                va = dict(variant.get("variant_attributes") or {})
+                va["images"] = own[:15]
+                if own:
+                    va["image_url"] = own[0]
+                    variant["image_url"] = own[0]
+                variant["variant_attributes"] = va
         except OssError as exc:
             suggestion.setdefault("attributes", {})
             suggestion["attributes"]["image_rehost_error"] = str(exc)

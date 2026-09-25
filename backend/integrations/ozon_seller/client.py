@@ -76,6 +76,9 @@ class OzonSellerClient:
         # v3 要求 description_category_id + type_id
         return self.request("POST", "/v3/product/import", {"items": items})
 
+    def import_prices(self, prices: list[dict[str, Any]]) -> dict[str, Any]:
+        return self.request("POST", "/v1/product/import/prices", {"prices": prices})
+
     def get_import_info(self, task_id: int) -> dict[str, Any]:
         return self.request("POST", "/v1/product/import/info", {"task_id": task_id})
 
