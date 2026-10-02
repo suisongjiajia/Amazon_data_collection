@@ -33,6 +33,7 @@ tmp_*.png
 tmp_*.jpg
 backend/scripts/_*.json
 backend/scripts/_*.txt
+backend/.cache/
 
 ### Ozon browser profile / diag ###
 .ozon-chrome-profile/

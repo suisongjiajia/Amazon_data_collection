@@ -144,6 +144,37 @@ def get_ozon_runtime_health() -> dict[str, Any]:
             },
         }
     )
+
+    from collector.alibaba1688.open_api import open_api_configured
+
+    open_ok = open_api_configured()
+    has_key = bool((os.getenv("ALIBABA_1688_APP_KEY") or os.getenv("ALI1688_APP_KEY") or "").strip())
+    has_secret = bool((os.getenv("ALIBABA_1688_APP_SECRET") or os.getenv("ALI1688_APP_SECRET") or "").strip())
+    has_token = bool(
+        (os.getenv("ALIBABA_1688_ACCESS_TOKEN") or os.getenv("ALI1688_ACCESS_TOKEN") or "").strip()
+        or (os.getenv("ALIBABA_1688_REFRESH_TOKEN") or os.getenv("ALI1688_REFRESH_TOKEN") or "").strip()
+    )
+    if open_ok:
+        msg_open = "开放平台已配置；详情仅走 API（关注+铺货+查询，幂等缓存）"
+    elif has_token and not (has_key and has_secret):
+        msg_open = "已有 ACCESS_TOKEN，仍缺 ALIBABA_1688_APP_KEY / APP_SECRET"
+    else:
+        msg_open = "未配置开放平台（详情采集必需，已不再使用 CDP 抓详情）"
+    checks.append(
+        {
+            "key": "alibaba_1688_open_api",
+            "label": "1688 开放平台详情",
+            "ok": open_ok,
+            "required": True,
+            "message": msg_open,
+            "hint": "open.1688.com 应用密钥 + OAuth token；接口 POST /1688/offer-collect",
+            "detail": {
+                "app_key": has_key,
+                "app_secret": has_secret,
+                "token": has_token,
+            },
+        }
+    )
     if seller_override and seller_override != cookie:
         checks.append(
             {

@@ -30,7 +30,7 @@ class Alibaba1688Offer:
 
 
 class Alibaba1688ShopCollector:
-    """通过本机调试 Chrome（CDP）采集 1688 整店商品列表 + 详情。"""
+    """CDP 采集店铺商品列表；详情仅走 1688 开放平台（关注+铺货+详情，幂等）。"""
 
     def __init__(self, *, delay_ms: int | None = None, timeout_ms: int | None = None) -> None:
         self.delay_ms = delay_ms if delay_ms is not None else int(os.getenv("1688_SHOP_DELAY_MS", "800"))
@@ -74,12 +74,56 @@ class Alibaba1688ShopCollector:
                             "或店铺需要先在调试 Chrome 里手动打开一次"
                         )
                     offers: list[Alibaba1688Offer] = []
+                    from collector.alibaba1688.open_api import AlibabaOpenApiClient, open_api_configured
+                    from collector.alibaba1688.open_product_detail import (
+                        fetch_offer_via_open_api,
+                        prefetch_relations_for_offers,
+                    )
+
+                    if not open_api_configured():
+                        raise RuntimeError(
+                            "未配置 1688 开放平台（ALIBABA_1688_APP_KEY/SECRET/ACCESS_TOKEN）。"
+                            "详情采集已改为仅走开放平台，请先配置后再采集店铺。"
+                        )
+                    api = AlibabaOpenApiClient()
+                    offer_ids = [
+                        str(ref.get("offer_id") or "").strip()
+                        for ref in offer_refs[:limit]
+                        if str(ref.get("offer_id") or "").strip().isdigit()
+                    ]
+                    logger.info(
+                        "1688 shop collect: prefetch relation/push for %s offers (no CDP detail)",
+                        len(offer_ids),
+                    )
+                    try:
+                        prefetch = prefetch_relations_for_offers(offer_ids, client=api)
+                        logger.info(
+                            "1688 prefetch done related_ok=%s synced=%s skipped=%s",
+                            prefetch.get("related_ok"),
+                            len((prefetch.get("sync") or {}).get("synced") or []),
+                            len((prefetch.get("sync") or {}).get("skipped") or []),
+                        )
+                    except Exception as exc:
+                        logger.warning("1688 prefetch relation/push 部分失败，将逐条重试: %s", exc)
+
                     for index, ref in enumerate(offer_refs[:limit]):
-                        detail = self._fetch_offer_detail(page, ref)
+                        oid = str(ref.get("offer_id") or "").strip()
+                        detail = fetch_offer_via_open_api(oid, client=api, ensure_relation=True)
+                        # 列表页标题/价/图作兜底补全
+                        if not detail.title and ref.get("title"):
+                            detail.title = str(ref.get("title") or "").strip() or detail.title
+                        if not detail.price_text and ref.get("price"):
+                            detail.price_text = str(ref.get("price") or "").strip() or detail.price_text
+                        if not detail.main_image_url and ref.get("image"):
+                            detail.main_image_url = (
+                                str(ref.get("image") or "").strip() or detail.main_image_url
+                            )
                         detail.raw_payload = {
                             **(detail.raw_payload or {}),
+                            "list_ref": ref,
                             "shop_url": parsed.source_url,
                             "sales_rank": index + 1,
+                            "detail_source": "open_api_only",
                         }
                         offers.append(detail)
                         self._sleep()
@@ -262,6 +306,12 @@ class Alibaba1688ShopCollector:
         return list(seen.values())[:limit]
 
     def _fetch_offer_detail(self, page: Any, ref: dict[str, str]) -> Alibaba1688Offer:
+        """已废弃：详情改为开放平台。保留函数避免外部旧引用直接爆炸。"""
+        raise RuntimeError(
+            "1688 详情采集已禁用 CDP。请配置开放平台并使用 fetch_offer_via_open_api。"
+        )
+
+    def _legacy_fetch_offer_detail_cdp_disabled(self, page: Any, ref: dict[str, str]) -> Alibaba1688Offer:
         offer_id = ref["offer_id"]
         url = ref.get("url") or f"https://detail.1688.com/offer/{offer_id}.html"
         sku_payloads: list[dict[str, Any]] = []

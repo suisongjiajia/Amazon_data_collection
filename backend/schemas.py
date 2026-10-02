@@ -83,6 +83,12 @@ class Alibaba1688ShopCollectRequest(BaseModel):
     top_n: int | None = 50
 
 
+class Alibaba1688OfferCollectRequest(BaseModel):
+    """offerId 或详情 URL，经开放平台 queryProductDetail 入库。"""
+
+    offer: str
+
+
 class ShopPipelineFromCollectionRequest(BaseModel):
     collection_task_id: int
     limit: int | None = None

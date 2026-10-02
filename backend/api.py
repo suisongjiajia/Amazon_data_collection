@@ -25,6 +25,7 @@ from schemas import (
     SelectionVariantScopeUpdateRequest,
     ShopPipelineStartRequest,
     ShopPipelineFromCollectionRequest,
+    Alibaba1688OfferCollectRequest,
     Alibaba1688ShopCollectRequest,
     SourcingSearchRequest,
 )
@@ -267,6 +268,18 @@ def collect_1688_shop(request: Alibaba1688ShopCollectRequest) -> dict[str, Any]:
             request.shop_url,
             top_n=request.top_n,
         ),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.post("/1688/offer-collect")
+def collect_1688_offer(request: Alibaba1688OfferCollectRequest) -> dict[str, Any]:
+    """按 offerId / 详情链接，经开放平台拉详情入库。"""
+    from services import alibaba1688_collection_service
+
+    return handle_api_errors(
+        lambda: alibaba1688_collection_service.run_1688_offer_collection(request.offer),
         value_error_status=400,
         runtime_error_status=502,
     )

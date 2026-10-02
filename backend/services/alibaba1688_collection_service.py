@@ -391,7 +391,7 @@ def get_1688_product_family(family_id: int) -> dict[str, Any]:
 
 
 def run_1688_shop_collection(shop_url: str, *, top_n: int | None = None) -> dict[str, Any]:
-    """采集 1688 整店 Top N 商品（CDP）。"""
+    """采集 1688 整店 Top N 商品（列表 CDP；详情优先开放平台 API）。"""
     limit = top_n if top_n is not None else _default_top_n()
     parsed = Alibaba1688UrlParser().parse(shop_url)
     if parsed.type is not Alibaba1688UrlType.SHOP:
@@ -436,6 +436,71 @@ def run_1688_shop_collection(shop_url: str, *, top_n: int | None = None) -> dict
                 f"已采集 {len(saved)} 个商品，并启动类目匹配/AI/进审核流水线：{job.get('job_no')}"
             )
         return result
+    except Exception as exc:
+        finish_collection_task(
+            int(task["id"]),
+            status="failed",
+            total_count=0,
+            success_count=0,
+            fail_count=1,
+            error_message=str(exc),
+        )
+        raise
+
+
+def run_1688_offer_collection(offer_url_or_id: str) -> dict[str, Any]:
+    """按 offerId / 详情链接，经开放平台拉商品详情并入库。"""
+    from collector.alibaba1688.open_api import open_api_configured
+    from collector.alibaba1688.open_product_detail import fetch_offer_via_open_api
+
+    text = str(offer_url_or_id or "").strip()
+    if not text:
+        raise ValueError("请提供 1688 offerId 或详情链接")
+    parsed = Alibaba1688UrlParser().parse(text) if "1688" in text or "/" in text else None
+    if parsed is not None and parsed.type is Alibaba1688UrlType.OFFER and parsed.offer_id:
+        offer_id = parsed.offer_id
+        source_url = parsed.source_url
+    elif text.isdigit():
+        offer_id = text
+        source_url = f"https://detail.1688.com/offer/{offer_id}.html"
+    else:
+        # 再试一次宽松解析
+        try:
+            parsed2 = Alibaba1688UrlParser().parse(text)
+        except Exception as exc:
+            raise ValueError("请提供数字 offerId 或 https://detail.1688.com/offer/xxx.html") from exc
+        if parsed2.type is not Alibaba1688UrlType.OFFER or not parsed2.offer_id:
+            raise ValueError("请提供数字 offerId 或 https://detail.1688.com/offer/xxx.html")
+        offer_id = parsed2.offer_id
+        source_url = parsed2.source_url
+
+    if not open_api_configured():
+        raise RuntimeError(
+            "未配置 1688 开放平台：需要 ALIBABA_1688_APP_KEY / APP_SECRET / ACCESS_TOKEN"
+        )
+
+    params = {"offer_id": offer_id, "source": "open_api"}
+    task = create_1688_collection_task("offer", params, source_url=source_url)
+    try:
+        offer = fetch_offer_via_open_api(offer_id)
+        saved = save_1688_products(int(task["id"]), [offer])
+        task = finish_collection_task(
+            int(task["id"]),
+            status="completed",
+            total_count=len(saved),
+            success_count=len(saved),
+            fail_count=0,
+        )
+        return {
+            "task": task,
+            "families": saved,
+            "offer_id": offer_id,
+            "count": len(saved),
+            "sku_count": len(offer.skus),
+            "title": offer.title,
+            "price_text": offer.price_text,
+            "message": f"已通过开放平台采集 offer {offer_id}，{len(offer.skus)} 个 SKU",
+        }
     except Exception as exc:
         finish_collection_task(
             int(task["id"]),
