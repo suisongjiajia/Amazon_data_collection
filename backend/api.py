@@ -750,9 +750,63 @@ def republish_listed_edit(edit_id: int) -> dict[str, Any]:
 
 @router.post("/ozon/publish-tasks/ai-heal/{edit_id}")
 def ai_heal_and_republish(edit_id: int) -> dict[str, Any]:
-    """发布失败后：规则修复 + AI 修复尺寸/字典属性，并自动重推。"""
+    """发布失败后：规则修复 + AI 修复尺寸/字典属性，并自动重推。
+
+    手动触发时重置自愈计数，上限从本次点击起算。
+    """
     return handle_api_errors(
-        lambda: publish_auto_service.heal_and_republish(edit_id, auto_follow=True),
+        lambda: publish_auto_service.heal_and_republish(
+            edit_id,
+            auto_follow=True,
+            reset_attempts=True,
+        ),
         value_error_status=400,
         runtime_error_status=502,
     )
+
+
+@router.get("/ozon/daily-fix/status")
+def ozon_daily_fix_status() -> dict[str, Any]:
+    """查看每日自动修复调度状态与上次执行结果。"""
+    from services import ozon_daily_fix_service
+
+    return handle_api_errors(ozon_daily_fix_service.get_daily_fix_status)
+
+
+@router.post("/ozon/daily-fix/run")
+def ozon_daily_fix_run(dry_run: bool = False) -> dict[str, Any]:
+    """立刻扫描 Ozon「准备销售/错误/待修改」并自动修复（也可 dry_run 只看数量）。"""
+    from services import ozon_daily_fix_service
+
+    return handle_api_errors(
+        lambda: ozon_daily_fix_service.run_daily_fix(dry_run=dry_run),
+        value_error_status=400,
+        runtime_error_status=502,
+    )
+
+
+@router.get("/ozon/daily-fix/scan")
+def ozon_daily_fix_scan() -> dict[str, Any]:
+    """只拉取问题商品清单，不修改。"""
+    from services import ozon_daily_fix_service
+
+    def _action() -> dict[str, Any]:
+        collected = ozon_daily_fix_service.collect_problem_products()
+        return {
+            "ok": True,
+            "counts": collected["counts"],
+            "total": collected["total"],
+            "buckets": {
+                label: [
+                    {
+                        "offer_id": row.get("offer_id"),
+                        "product_id": row.get("product_id"),
+                        "visibility": row.get("visibility"),
+                    }
+                    for row in rows
+                ]
+                for label, rows in collected["buckets"].items()
+            },
+        }
+
+    return handle_api_errors(_action, runtime_error_status=502)

@@ -203,9 +203,9 @@ def update_content(
         raise ValueError("仅待审核或待修复的商品可在审核中心修改")
 
     attrs = dict(edit.get("attributes") or {})
-    aspect = str(variant_aspect or attrs.get("variant_aspect") or "color").strip().lower()
-    if aspect not in {"color", "size"}:
-        aspect = "color"
+    from services.ozon_attribute_fill import enrich_variant_aspect_fields, normalize_variant_aspect
+
+    aspect = normalize_variant_aspect(variant_aspect or attrs.get("variant_aspect") or "color")
     attrs["variant_aspect"] = aspect
     if any(value is not None for value in (depth_mm, width_mm, height_mm, weight_g)):
         if not all(value and int(value) > 0 for value in (depth_mm, width_mm, height_mm, weight_g)):
@@ -250,7 +250,7 @@ def update_content(
         va = dict(current.get("variant_attributes") or {})
         color = item.get("color")
         size_text = str(item.get("size") or "").strip()
-        # 双区分项：颜色/款式与尺码都保留；合卡区分轴由 variant_aspect 决定
+        # 双区分项：颜色与尺码分开保存；both 时两侧都写进区分字段
         if color is not None:
             text = str(color).strip()
             if text:
@@ -259,9 +259,8 @@ def update_content(
                 va["Цвет"] = text
                 va["Цвет товара"] = text
                 va["Название цвета"] = text
-                va["区分项"] = text
             else:
-                for key in ("颜色", "款式", "Цвет", "Цвет товара", "Название цвета", "区分项"):
+                for key in ("颜色", "款式", "Цвет", "Цвет товара", "Название цвета"):
                     va.pop(key, None)
         if size_text:
             va["尺码"] = size_text
@@ -271,13 +270,22 @@ def update_content(
             for key in ("尺码", "Размер", "Размер товара"):
                 va.pop(key, None)
         if aspect == "size":
-            # 上架按尺码区分时，颜色属性可留作备注，但主区分用尺码
             if size_text:
                 va["区分项"] = size_text
+        elif aspect == "both":
+            color_part = str(va.get("颜色") or "").strip()
+            size_part = str(va.get("尺码") or size_text or "").strip()
+            if color_part and size_part:
+                va["区分项"] = f"{color_part} · {size_part}"
+            elif color_part:
+                va["区分项"] = color_part
+            elif size_part:
+                va["区分项"] = size_part
         elif aspect == "color" and color is not None:
             text = str(color).strip()
             if text:
                 va["区分项"] = text
+        va = enrich_variant_aspect_fields(va)
         price = item.get("price")
         quantity = item.get("quantity")
         _apply_net_product_size(

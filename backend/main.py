@@ -13,6 +13,15 @@ import database
 async def lifespan(app: FastAPI):
     database.init_db()
     try:
+        from services.ozon_daily_fix_service import start_daily_fix_scheduler
+
+        start_daily_fix_scheduler()
+    except Exception:
+        # 调度启动失败不影响主服务
+        import logging
+
+        logging.getLogger(__name__).exception("启动 Ozon 日修调度失败")
+    try:
         yield
     finally:
         shutdown_ozon_browser_session()

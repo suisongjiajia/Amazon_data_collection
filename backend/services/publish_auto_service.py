@@ -22,7 +22,7 @@ _active_follows: set[int] = set()
 HEAL_SYSTEM_PROMPT = """你是 Ozon Seller API 上架排错专家。根据报错信息与当前 listing，输出修正后的商品编辑 JSON。
 
 只输出 JSON，字段：
-title, description, bullet_points, attributes, variants（含 sku/title/price/quantity）, images
+title, description, bullet_points, attributes, variants（含 sku/title/price/quantity/variant_attributes）, images
 
 硬性规则：
 1. 保留 description_category_id、type_id、currency_code、fulfillment、brand_mode；不要删图片。
@@ -33,9 +33,15 @@ title, description, bullet_points, attributes, variants（含 sku/title/price/qu
 3. 字典属性错误（«все возможные значения собраны в виде списка» / Рецепт 等）：
    - 不要手填自由文本；改成该类目常见俄语字典选项，或删除该属性键让系统跳过。
    - 不确定时删除报错提到的属性键，不要瞎编。
-4. 旧价 old_price 由系统按售价×1.3 生成，你只需保证 variants[].price > 0。
-5. variants[].quantity 必须保持原值或使用较大正整数（如 99），禁止改成 0/1/2 等过小库存。
-6. 标题/描述保持俄语；不要编造违法信息。
+4. DUPLICATE_ASPECT_PAIR / 颜色+尺码组合重复 / 合卡会被 Ozon 拒绝：
+   - 必须改 variants[].variant_attributes，使每对 (Название цвета, Размер) 全局唯一。
+   - 楼梯台阶类：尺码用「N ступени」，不要用「【30CM】」这种高度残片。
+   - 布套/换洗外套/不含楼梯：颜色写成「серый чехол」等，尺码写成「чехол N ступени」，与同色楼梯区分。
+   - 深灰与灰不要都写成 серый：深灰用 тёмно-серый。
+   - 保留全部 SKU，不要删变体；只改区分字段与必要时的俄语 title。
+5. 旧价 old_price 由系统按售价×1.3 生成，你只需保证 variants[].price > 0。
+6. variants[].quantity 必须保持原值或使用较大正整数（如 99），禁止改成 0/1/2 等过小库存。
+7. 标题/描述保持俄语；不要编造违法信息。
 """
 
 
@@ -286,17 +292,33 @@ def heal_and_republish(
     *,
     source_task: dict[str, Any] | None = None,
     auto_follow: bool = True,
+    reset_attempts: bool = False,
 ) -> dict[str, Any]:
-    """对发布失败的编辑做规则修复 + AI 修复，然后重新推送。"""
+    """对发布失败的编辑做规则修复 + AI 修复，然后重新推送。
+
+    reset_attempts=True：用户手动点「AI 修复」时从 0 重新计数（上限只限制本次点击后的自动跟进）。
+    后台自动自愈保持 reset_attempts=False，沿用累计次数防死循环。
+    """
     from db.ozon_workflow import update_product_edit
 
     edit = get_product_edit(edit_id)
     pipeline_item = find_pipeline_item_by_edit(edit_id)
-    attempts = int((pipeline_item or {}).get("heal_attempts") or 0)
     attrs = dict(edit.get("attributes") or {})
-    attempts = max(attempts, int(attrs.get("heal_attempts") or 0))
+    if reset_attempts:
+        attempts = 0
+        attrs["heal_attempts"] = "0"
+        update_product_edit(edit_id, attributes=attrs)
+        if pipeline_item:
+            update_pipeline_item(int(pipeline_item["id"]), heal_attempts=0)
+            pipeline_item = {**pipeline_item, "heal_attempts": 0}
+    else:
+        attempts = int((pipeline_item or {}).get("heal_attempts") or 0)
+        attempts = max(attempts, int(attrs.get("heal_attempts") or 0))
     if attempts >= _heal_max_attempts():
-        raise ValueError(f"AI 自愈已达上限（{_heal_max_attempts()} 次），请人工回编辑修复")
+        raise ValueError(
+            f"本次 AI 自愈已达上限（{_heal_max_attempts()} 次），请人工回编辑修复；"
+            f"手动再点「AI 修复」会重新开始计数"
+        )
 
     if source_task is None:
         source_task = {
@@ -330,17 +352,68 @@ def heal_and_republish(
     }
     error_text = json.dumps(error_blob, ensure_ascii=False)
 
-    # 1) 规则修复（密度 / 明显字典属性）
-    edit = _apply_deterministic_fixes(edit, error_text)
+    # 0) 同账号 SPU 重复：归档多余卡，不烧 AI、不重推重复货号
+    from integrations.ozon_seller.client import OzonSellerClient
+    from services.ozon_spu_duplicate_service import (
+        error_blob_looks_like_same_account_spu,
+        resolve_spu_duplicates_for_edit,
+    )
 
-    # 2) AI 修复
-    preview = preview_listing(edit)
+    company_id = OzonSellerClient().client_id
+    if error_blob_looks_like_same_account_spu(error_text, company_id=company_id):
+        spu_result = resolve_spu_duplicates_for_edit(edit_id, dry_run=False)
+        archived = int(spu_result.get("archive_count") or 0)
+        if archived > 0:
+            if pipeline_item:
+                update_pipeline_item(
+                    int(pipeline_item["id"]),
+                    status="listed",
+                    error_message=spu_result.get("message") or "已归档同账号 SPU 重复卡",
+                    clear_error=True,
+                )
+            return {
+                "ok": True,
+                "heal_attempt": attempts,
+                "spu_archive": spu_result,
+                "message": spu_result.get("message")
+                or f"已归档 {archived} 张同账号 SPU 重复卡（保留在售货号）",
+            }
+
+    # 1) 规则修复（密度 / 字典属性 / 合卡撞车）
+    edit = _apply_deterministic_fixes(edit, error_text)
+    edit = get_product_edit(edit_id)
+
+    # 2) 仅用本地校验决定是否调 AI（避免 preview_listing 走 build/字典 API 很慢）
+    from services.ozon_listing_payload import collect_listing_issues
+
     qty_by_sku = {
         str(v.get("sku") or ""): v.get("quantity")
         for v in (edit.get("variants") or [])
         if v.get("sku")
     }
-    fixed = _ai_heal_listing(edit, preview, error_blob)
+    local_issues = collect_listing_issues(edit)
+    remaining_errors = [i for i in local_issues if i.get("severity") == "error"]
+    preview = {"issues": local_issues, "ok": not remaining_errors}
+    if not remaining_errors:
+        fixed = {
+            "title": edit.get("title"),
+            "description": edit.get("description"),
+            "bullet_points": edit.get("bullet_points"),
+            "attributes": edit.get("attributes"),
+            "variants": [
+                {
+                    "sku": v.get("sku"),
+                    "title": v.get("title"),
+                    "price": v.get("price"),
+                    "quantity": v.get("quantity"),
+                    # 不把 variant_attributes 交给后续覆盖；合卡字段一律规则重算
+                }
+                for v in (edit.get("variants") or [])
+            ],
+            "images": edit.get("images"),
+        }
+    else:
+        fixed = _ai_heal_listing(edit, preview, error_blob)
     # 禁止 AI 把库存改成过小值
     from services.ozon_pricing_service import DEFAULT_STOCK_QTY
 
@@ -358,18 +431,42 @@ def heal_and_republish(
             original_qty = 0
         if qty < 10:
             variant["quantity"] = original_qty if original_qty >= 10 else default_qty
+        # AI 常把中文规格写回 颜色/尺码，导致再次撞车；合卡字段交给规则层
+        va = variant.get("variant_attributes")
+        if isinstance(va, dict):
+            for key in (
+                "颜色",
+                "尺码",
+                "Цвет",
+                "Цвет товара",
+                "Название цвета",
+                "Размер",
+                "Размер товара",
+                "款式",
+                "区分项",
+            ):
+                va.pop(key, None)
     reopen_product_edit(edit_id)
     product_edit_service.apply_ai_suggestion_to_edit(edit_id, fixed)
 
-    # 3) 再跑一遍密度规则，避免 AI 仍给过轻重量
+    # 3) 密度规则 + 强制重算合卡区分项（防止 AI/旧数据写回 【30CM】）
     edit = get_product_edit(edit_id)
     edit = _apply_deterministic_fixes(edit, error_text)
-    attrs = dict(edit.get("attributes") or {})
+    from services.ozon_attribute_fill import apply_unique_aspect_labels_to_edit
+
+    apply_unique_aspect_labels_to_edit(get_product_edit(edit_id))
+    attrs = dict(get_product_edit(edit_id).get("attributes") or {})
     attrs["heal_attempts"] = str(attempts + 1)
     attrs["last_heal_errors"] = (source_task.get("error_message") or "")[:1000]
     update_product_edit(edit_id, attributes=attrs)
 
     built = product_edit_service.build_listing(edit_id)
+    if not built.get("ok") or not built.get("saved"):
+        # 若仍是合卡撞车，再强制拆一次后重试
+        issues = built.get("issues") or []
+        if any(i.get("code") == "DUPLICATE_ASPECT_PAIR" for i in issues):
+            apply_unique_aspect_labels_to_edit(get_product_edit(edit_id))
+            built = product_edit_service.build_listing(edit_id)
     if not built.get("ok") or not built.get("saved"):
         messages = "; ".join(
             issue.get("message") or ""
@@ -403,14 +500,62 @@ def heal_and_republish(
 
 
 def _apply_deterministic_fixes(edit: dict[str, Any], error_text: str) -> dict[str, Any]:
-    """针对 density / 字典属性做可预期的机械修复。"""
+    """针对 density / 字典属性 / 合卡撞车做可预期的机械修复。"""
     from db.ozon_workflow import update_product_edit
+    from services.ozon_attribute_fill import apply_unique_aspect_labels_to_edit
     from services.ozon_listing_payload import read_package_metrics, read_variant_package_metrics
 
     edit_id = int(edit["id"])
     attrs = dict(edit.get("attributes") or {})
     lower = (error_text or "").lower()
     changed = False
+
+    # 合卡撞车 / 阶数尺码：楼梯 vs 布套、三阶→N ступени（自愈路径一律重算，成本低）
+    rewritten = apply_unique_aspect_labels_to_edit(edit)
+    if rewritten:
+        edit = get_product_edit(edit_id)
+        changed = True
+
+    # Ozon DESCRIPTION_DECLINE / 错误 Тип：按标题纠正 type_id
+    if any(
+        token in lower
+        for token in (
+            "description_decline",
+            "неверный тип",
+            "изменить тип",
+            "attribute_id\": \"8229",
+            "attribute_id\": 8229",
+            "тип",
+        )
+    ) or "8229" in (error_text or ""):
+        from services.ozon_category_tree import (
+            correct_category_id_for_type,
+            find_type_name,
+            suggest_type_id_from_text,
+        )
+
+        title = str(edit.get("title") or "")
+        desc = str(edit.get("description") or "")
+        blob = f"{title} {desc}".casefold()
+        old_type = attrs.get("type_id")
+        suggested = suggest_type_id_from_text(title, desc, current_type_id=old_type)
+        if any(t in blob for t in ("лестниц", "ступен", "爬梯", "пандус")) and "домик" not in blob:
+            suggested = 95204
+        elif any(t in blob for t in ("домик", "猫窝", "закрыт")):
+            suggested = 95199
+        if suggested and str(suggested) != str(old_type):
+            cat, type_text, _ = correct_category_id_for_type(
+                description_category_id=attrs.get("description_category_id"),
+                type_id=suggested,
+            )
+            attrs["type_id"] = int(type_text) if type_text and str(type_text).isdigit() else int(suggested)
+            if cat and str(cat).isdigit():
+                attrs["description_category_id"] = int(cat)
+            for key in list(attrs.keys()):
+                if str(key).strip().lower() in {"тип", "type", "type_name"}:
+                    attrs.pop(key, None)
+            attrs["type_name"] = find_type_name(attrs["type_id"]) or ""
+            changed = True
 
     # 字典属性：报错点名 Рецепт 等时，删除自由文本，避免再次提交非法值
     dict_tokens = ("списка", "dictionary", "рецепт", "неверное значение атрибута")
@@ -469,7 +614,10 @@ def _ai_heal_listing(
 ) -> dict[str, Any]:
     client = DeepSeekClient()
     user_prompt = (
-        "请根据 Ozon 报错修复 listing。优先处理 density/尺寸重量 与 字典属性。"
+        "请根据 Ozon/本地校验报错修复 listing。"
+        "优先处理：①颜色+尺码合卡撞车(DUPLICATE_ASPECT_PAIR) ②density/尺寸重量 ③字典属性。"
+        "若 preview_issues 含 DUPLICATE_ASPECT_PAIR，必须改每个冲突变体的 variant_attributes"
+        "（Название цвета / Размер / 区分项），保证组合唯一；布套加 чехол。"
         "不确定的字典属性请删除该键。当前数据：\n\n"
         + json.dumps(
             {

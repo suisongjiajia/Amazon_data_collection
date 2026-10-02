@@ -116,11 +116,24 @@ def apply_ai_suggestion_to_edit(edit_id: int, suggestion: dict[str, Any]) -> dic
             price = float(sug["price"])
         else:
             price = None
+        # 按 sku 对齐 AI 变体（顺序可能被打乱）
+        sku = str(variant.get("sku") or "")
+        matched = sug
+        if sku:
+            for item in sug_variants:
+                if str(item.get("sku") or "") == sku:
+                    matched = item
+                    break
+        merged_va = None
+        incoming_va = matched.get("variant_attributes") if isinstance(matched, dict) else None
+        if isinstance(incoming_va, dict) and incoming_va:
+            merged_va = {**(variant.get("variant_attributes") or {}), **incoming_va}
         update_product_edit_variant(
             int(variant["id"]),
-            title=str(sug.get("title") or variant.get("title") or suggestion.get("title") or ""),
+            title=str(matched.get("title") or variant.get("title") or suggestion.get("title") or ""),
             price=price,
-            quantity=int(sug["quantity"]) if sug.get("quantity") is not None else None,
+            quantity=int(matched["quantity"]) if matched.get("quantity") is not None else None,
+            variant_attributes=merged_va,
         )
     return get_product_edit(edit_id)
 

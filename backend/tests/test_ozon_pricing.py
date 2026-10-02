@@ -1,4 +1,8 @@
-from services.xingyuan_freight import calc_xingyuan_economy_freight_cny, select_russia_economy_channel
+from services.xingyuan_freight import (
+    calc_xingyuan_economy_freight_cny,
+    normalize_package_for_shipping,
+    select_russia_economy_channel,
+)
 from services.ozon_pricing_service import calc_suggested_price_rub, variant_prices_from_collected
 
 
@@ -12,6 +16,20 @@ def test_calc_xingyuan_economy_freight():
     result = calc_xingyuan_economy_freight_cny(200)
     assert result["channel_code"] == "xy_economy_extra_small"
     assert result["freight_cny"] == round(3.37 + 0.0281 * 200, 2)
+
+
+def test_size_first_raises_weight_to_small_min():
+    # 三边和 100cm > 90 → 不能走 Extra Small；重量 300 须抬到 Small 下限 551
+    result = normalize_package_for_shipping(400, 300, 300, 300)
+    assert result["channel_code"] == "xy_economy_small"
+    assert result["weight_g"] == 551
+    assert result["weight_raised"] is True
+
+
+def test_extra_small_keeps_light_weight():
+    result = normalize_package_for_shipping(200, 150, 100, 300)
+    assert result["channel_code"] == "xy_economy_extra_small"
+    assert result["weight_g"] == 300
 
 
 def test_pricing_formula_a(monkeypatch):

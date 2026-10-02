@@ -128,6 +128,91 @@ def find_type_name(type_id: int | str, *, force_reload: bool = False) -> str | N
     return None
 
 
+# 标题/属性关键词 → type（顺序：越具体越靠前）
+_TYPE_KEYWORD_RULES: tuple[tuple[int, tuple[str, ...]], ...] = (
+    (98056, ("автогамак", "гамак", "车载", "汽车吊床")),
+    (95204, ("лестниц", "ступен", "пандус", "трап", "爬梯", "宠物楼梯", "缓步楼梯")),
+    (95199, ("домик", "ракуш", "гнезд", "тоннел", "shell", "贝壳", "猫窝", "半封闭", "封闭式")),
+    (95196, ("будка",)),
+    (95203, ("подстилк", "лежак-мат", "матрас", "коврик", "凉席", "睡垫", "垫子")),
+    (95203, ("лежак", "мат")),
+)
+
+
+def suggest_type_id_from_text(*texts: Any, current_type_id: int | str | None = None) -> int | None:
+    """
+    根据标题/规格推断更合适的 type_id。
+    当前 type 与文案冲突时返回建议值（贝壳窝≠汽车吊床，垫子≠狗窝）。
+    """
+    blob = " ".join(str(t or "") for t in texts).casefold()
+    if not blob.strip():
+        return None
+    load_type_category_index()
+
+    suggested: int | None = None
+    for type_id, keywords in _TYPE_KEYWORD_RULES:
+        if any(k.casefold() in blob for k in keywords):
+            suggested = type_id
+            break
+    if suggested is None:
+        return None
+
+    try:
+        current = int(str(current_type_id).strip()) if current_type_id is not None else None
+    except (TypeError, ValueError):
+        current = None
+    if current is None or current <= 0:
+        return suggested
+    if current == suggested:
+        return None
+
+    current_name = (_TYPE_TO_NAME.get(current) or "").casefold()
+
+    # 当前类型族与文案证据冲突 → 纠正
+    is_hammock_type = any(t in current_name for t in ("гамак", "автогамак"))
+    is_booth_type = "будка" in current_name
+    is_house_type = "домик" in current_name
+    is_bed_type = any(t in current_name for t in ("лежак", "подстилк", "матрас"))
+
+    has_hammock = any(t in blob for t in ("гамак", "автогамак", "车载"))
+    has_house = any(t in blob for t in ("домик", "ракуш", "гнезд", "тоннел", "贝壳", "猫窝", "半封闭", "закрыт"))
+    has_booth = "будка" in blob
+    has_mat = any(t in blob for t in ("подстилк", "мат", "матрас", "коврик", "凉席", "睡垫", "垫子"))
+    has_stair = any(t in blob for t in ("лестниц", "ступен", "пандус", "трап", "爬梯", "宠物楼梯"))
+    is_stair_type = "лестниц" in current_name
+    is_net_or_misc = any(t in current_name for t in ("сетк", "фиксатор", "гамак"))
+
+    if has_stair and suggested == 95204 and current != 95204:
+        return suggested
+    if is_stair_type and has_stair:
+        return None
+    if is_hammock_type and not has_hammock:
+        return suggested
+    if is_net_or_misc and has_house and suggested == 95199:
+        return suggested
+    if is_booth_type and has_house and not has_booth:
+        return suggested
+    if is_booth_type and has_mat and not has_booth and not has_house:
+        return suggested
+    if is_bed_type and has_house and suggested == 95199:
+        # 标题明确是窝/屋时切到 Домик；仅「лежак-мат」才保留床垫类
+        if any(t in blob for t in ("домик", "猫窝", "закрыт", "полузакрыт", "утепл")):
+            return suggested
+        if any(t in blob for t in ("подстилк", "мат", "ротанга", "ротанг", "凉席", "cooling")):
+            return None
+        return suggested
+    if is_house_type and has_mat and not has_house and suggested == 95203:
+        return suggested
+    if has_house and suggested == 95199 and current != 95199:
+        if is_bed_type and not any(t in blob for t in ("домик", "猫窝", "закрыт")):
+            return None
+        return suggested
+    if has_mat and not has_house and not has_booth and not has_stair and suggested == 95203 and current != 95203:
+        return suggested
+
+    return None
+
+
 def correct_category_id_for_type(
     *,
     description_category_id: int | str | None,

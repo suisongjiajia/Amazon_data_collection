@@ -335,7 +335,7 @@ def refresh_import_status(task_id: int) -> dict[str, Any]:
                         local_status,
                         str(pid_int) if pid_int > 0 else None,
                         sku,
-                        error_code,
+                        (str(error_code)[:64] if error_code else None),
                         error_message,
                         to_json(response_blob),
                         item["id"],

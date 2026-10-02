@@ -210,16 +210,25 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
         attributes.setdefault("weight", details["weight"])
     attributes.setdefault("brand_mode", "no_brand")
     attributes.setdefault("fulfillment", "rFBS")
+    # 任意来源：颜色×尺码矩阵 → 默认双区分轴
+    family_variants = family.get("variants") or []
+    from services.ozon_attribute_fill import detect_variant_aspect_mode
+
+    detected_aspect = detect_variant_aspect_mode(family_variants)
+    if detected_aspect == "both":
+        attributes.setdefault("variant_aspect", "both")
     if is_1688:
         attributes.setdefault("source_platform", "1688")
-        # 双区分项：采集时 color 已合成「款式 · 尺码」，合卡按颜色轴区分
-        family_variants = family.get("variants") or []
-        has_distinguished = any(
-            str(v.get("color") or (v.get("variant_attributes") or {}).get("区分项") or "").strip()
-            for v in family_variants
-        )
-        if has_distinguished:
-            attributes.setdefault("variant_aspect", "color")
+        if "variant_aspect" not in attributes:
+            has_distinguished = any(
+                str(v.get("color") or (v.get("variant_attributes") or {}).get("区分项") or "").strip()
+                for v in family_variants
+            )
+            if has_distinguished:
+                attributes.setdefault(
+                    "variant_aspect",
+                    detected_aspect if detected_aspect == "size" else "color",
+                )
         # 1688：优先用详情页包装尺寸/重量，避免被统一默认 100×100×100/200g 覆盖
         from collector.alibaba1688.package_parse import extract_package_metrics
         from services.ozon_listing_payload import package_is_manual
@@ -264,10 +273,34 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
         if package_metrics and not package_is_manual(attributes):
             attributes["package_manual"] = "1"
             attributes["package_source"] = "1688_detail"
-    # 全站统一包裹：100×100×100 mm / 200g（手改 / 1688 详情已写入则跳过）
+    # 可选统一假尺寸（默认关闭）；手改 / 1688 详情已写入则跳过
     from services.ozon_listing_payload import apply_fixed_package_attributes
 
     attributes = apply_fixed_package_attributes(attributes)
+
+    # 兴远：尺寸优先选档，抬高计费重量
+    try:
+        from services.xingyuan_freight import normalize_package_for_shipping
+        from services.ozon_pricing_service import write_package_fields
+
+        d = int(attributes.get("depth_mm") or 0)
+        w = int(attributes.get("width_mm") or 0)
+        h = int(attributes.get("height_mm") or 0)
+        wt = int(float(attributes.get("weight_g") or attributes.get("weight") or 0))
+        if d > 0 and w > 0 and h > 0 and wt > 0:
+            norm = normalize_package_for_shipping(d, w, h, wt)
+            attributes = write_package_fields(
+                attributes,
+                depth_mm=int(norm["depth_mm"]),
+                width_mm=int(norm["width_mm"]),
+                height_mm=int(norm["height_mm"]),
+                weight_g=int(norm["weight_g"]),
+            )
+            attributes["freight_channel"] = norm["channel_name"]
+            attributes["freight_cny"] = str(norm["freight_cny"])
+            attributes["package_source"] = attributes.get("package_source") or "xingyuan_size_first"
+    except Exception:
+        pass
 
     initial_qty = DEFAULT_STOCK_QTY
     initial_price = None
@@ -276,14 +309,57 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
         priced = suggest_price_for_family(raw_product_family_id)
         initial_price = priced["pricing"]["list_price"]
         initial_qty = priced["pricing"]["stock_qty"]
-        from services.ozon_pricing_service import variant_prices_from_collected
+        from services.ozon_pricing_service import parse_cny_price, suggest_price_for_package
+        from services.ozon_variant_cost_match import match_cost_by_listing_title
 
-        scaled_prices = variant_prices_from_collected(
-            int(initial_price),
-            list(family.get("variants") or []),
-            anchor_external_id=str(family.get("external_id") or ""),
-        )
-        attributes["pricing_formula"] = priced["pricing"]["formula"]
+        # 每变体：按标题匹配货本 + 包装/兴远档 → 独立售价
+        price_sku_prefix = "A1688-" if is_1688 else "OZON-"
+        family_d = int(attributes.get("depth_mm") or 0)
+        family_w = int(attributes.get("width_mm") or 0)
+        family_h = int(attributes.get("height_mm") or 0)
+        family_wt = int(float(attributes.get("weight_g") or 0) or 0)
+        scaled_prices = []
+        for variant in family.get("variants") or []:
+            va = dict(variant.get("variant_attributes") or {})
+            try:
+                vd = int(va.get("depth_mm") or family_d or 0)
+                vw = int(va.get("width_mm") or family_w or 0)
+                vh = int(va.get("height_mm") or family_h or 0)
+                vwt = int(float(va.get("weight_g") or family_wt or 0))
+            except (TypeError, ValueError):
+                vd, vw, vh, vwt = family_d, family_w, family_h, family_wt
+            fake_variant = {
+                "sku": f"{price_sku_prefix}{variant.get('external_id') or variant['id']}",
+                "title": variant.get("title"),
+                "variant_attributes": va,
+            }
+            matched = match_cost_by_listing_title(
+                fake_variant,
+                family,
+                edit_title=str(family.get("title") or ""),
+            )
+            cost = (matched or {}).get("cost") or parse_cny_price(
+                variant.get("price_text") or va.get("price_text")
+            )
+            if matched and matched.get("weight_g") and int(matched["weight_g"]) > 200:
+                vwt = int(matched["weight_g"])
+            if not cost:
+                cost = float(priced["pricing"]["supplier_price_cny"])
+            if vd > 0 and vw > 0 and vh > 0 and vwt > 0:
+                try:
+                    v_priced = suggest_price_for_package(
+                        supplier_price_cny=float(cost),
+                        depth_mm=vd,
+                        width_mm=vw,
+                        height_mm=vh,
+                        weight_g=vwt,
+                    )
+                    scaled_prices.append(int(v_priced["pricing"]["list_price"]))
+                    continue
+                except Exception:
+                    pass
+            scaled_prices.append(int(initial_price))
+        attributes["pricing_formula"] = "per_variant_size_first"
         attributes["currency_code"] = priced["pricing"]["currency_code"]
         attributes["freight_channel"] = priced["freight"]["channel_name"]
         attributes["freight_cny"] = str(priced["freight"]["freight_cny"])
@@ -350,6 +426,28 @@ def create_product_edit(raw_product_family_id: int) -> dict[str, Any]:
                     va["images"] = built[:15]
                     if built:
                         va["image_url"] = built[0]
+                # 变体包装按兴远尺寸档校正重量
+                try:
+                    from services.ozon_pricing_service import write_package_fields
+                    from services.xingyuan_freight import normalize_package_for_shipping
+
+                    vd = int(va.get("depth_mm") or attributes.get("depth_mm") or 0)
+                    vw = int(va.get("width_mm") or attributes.get("width_mm") or 0)
+                    vh = int(va.get("height_mm") or attributes.get("height_mm") or 0)
+                    vwt = int(float(va.get("weight_g") or attributes.get("weight_g") or 0))
+                    if vd > 0 and vw > 0 and vh > 0 and vwt > 0:
+                        vnorm = normalize_package_for_shipping(vd, vw, vh, vwt)
+                        va = write_package_fields(
+                            va,
+                            depth_mm=int(vnorm["depth_mm"]),
+                            width_mm=int(vnorm["width_mm"]),
+                            height_mm=int(vnorm["height_mm"]),
+                            weight_g=int(vnorm["weight_g"]),
+                        )
+                        va["freight_channel"] = vnorm["channel_name"]
+                        va["freight_cny"] = str(vnorm["freight_cny"])
+                except Exception:
+                    pass
                 cursor.execute(
                     """
                     INSERT INTO product_edit_variant (
@@ -601,6 +699,105 @@ def update_product_edit_variant(
     return record
 
 
+def find_product_edit_variants_by_skus(skus: list[str]) -> list[dict[str, Any]]:
+    cleaned = [str(s).strip() for s in skus if str(s).strip()]
+    if not cleaned:
+        return []
+    placeholders = ", ".join(["%s"] * len(cleaned))
+    return fetch_all(
+        f"""
+        SELECT id, edit_id, sku, title, price, quantity
+        FROM product_edit_variant
+        WHERE sku IN ({placeholders})
+        """,
+        tuple(cleaned),
+    )
+
+
+def delete_product_edit_variants_by_skus(skus: list[str]) -> list[int]:
+    """按货号删除本地变体，返回受影响的 edit_id 列表。"""
+    cleaned = [str(s).strip() for s in skus if str(s).strip()]
+    if not cleaned:
+        return []
+    rows = find_product_edit_variants_by_skus(cleaned)
+    edit_ids = sorted({int(r["edit_id"]) for r in rows if r.get("edit_id") is not None})
+    variant_ids = [int(r["id"]) for r in rows]
+    placeholders = ", ".join(["%s"] * len(cleaned))
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            if variant_ids:
+                id_ph = ", ".join(["%s"] * len(variant_ids))
+                # edit_variant_id 非空，先删发布明细再删变体
+                cursor.execute(
+                    f"DELETE FROM ozon_publish_item WHERE edit_variant_id IN ({id_ph})",
+                    tuple(variant_ids),
+                )
+            cursor.execute(
+                f"DELETE FROM product_edit_variant WHERE sku IN ({placeholders})",
+                tuple(cleaned),
+            )
+    for edit_id in edit_ids:
+        edit = get_product_edit(edit_id)
+        if edit.get("status") == "listing_ready" or edit.get("listing_payload"):
+            update_product_edit(
+                edit_id,
+                clear_listing=True,
+                status="editing" if edit.get("status") == "listing_ready" else None,
+            )
+    return edit_ids
+
+
+def remap_product_edit_variant_sku(old_sku: str, new_sku: str) -> bool:
+    """把本地变体货号改成已在售的 keeper；若目标货号已存在则删掉旧变体。"""
+    old_sku = str(old_sku or "").strip()
+    new_sku = str(new_sku or "").strip()
+    if not old_sku or not new_sku or old_sku == new_sku:
+        return False
+    old_rows = find_product_edit_variants_by_skus([old_sku])
+    if not old_rows:
+        return False
+    new_rows = find_product_edit_variants_by_skus([new_sku])
+    keeper_by_edit = {int(r["edit_id"]): int(r["id"]) for r in new_rows}
+    existing_edit_ids = set(keeper_by_edit)
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            for row in old_rows:
+                edit_id = int(row["edit_id"])
+                old_vid = int(row["id"])
+                if edit_id in existing_edit_ids:
+                    keeper_vid = keeper_by_edit[edit_id]
+                    cursor.execute(
+                        """
+                        UPDATE ozon_publish_item
+                        SET edit_variant_id = %s, seller_sku = %s
+                        WHERE edit_variant_id = %s
+                        """,
+                        (keeper_vid, new_sku, old_vid),
+                    )
+                    cursor.execute("DELETE FROM product_edit_variant WHERE id = %s", (old_vid,))
+                else:
+                    cursor.execute(
+                        "UPDATE product_edit_variant SET sku = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s",
+                        (new_sku, old_vid),
+                    )
+                    cursor.execute(
+                        "UPDATE ozon_publish_item SET seller_sku = %s WHERE edit_variant_id = %s",
+                        (new_sku, old_vid),
+                    )
+                    existing_edit_ids.add(edit_id)
+                    keeper_by_edit[edit_id] = old_vid
+    touched = sorted({int(r["edit_id"]) for r in old_rows})
+    for edit_id in touched:
+        edit = get_product_edit(edit_id)
+        if edit.get("status") == "listing_ready" or edit.get("listing_payload"):
+            update_product_edit(
+                edit_id,
+                clear_listing=True,
+                status="editing" if edit.get("status") == "listing_ready" else None,
+            )
+    return True
+
+
 def submit_product_edit_for_review(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
     if edit["status"] not in ("listing_ready",):
@@ -612,15 +809,21 @@ def submit_product_edit_for_review(edit_id: int) -> dict[str, Any]:
 
 def reopen_product_edit(edit_id: int) -> dict[str, Any]:
     edit = get_product_edit(edit_id)
-    if edit["status"] not in (
+    status = str(edit.get("status") or "")
+    # 已在编辑中：直接返回，供 AI 自愈 / 日修继续改稿
+    if status == "editing":
+        return edit
+    if status not in (
+        "draft",
         "listing_ready",
         "pending_review",
         "needs_fix",
         "approved",
         "rejected",
         "published",
+        "publishing",
     ):
-        raise ValueError("当前状态不可重新打开编辑")
+        raise ValueError(f"当前状态不可重新打开编辑（status={status or '?'}）")
     return update_product_edit(edit_id, status="editing", clear_listing=True)
 
 

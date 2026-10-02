@@ -425,19 +425,31 @@ def clear_all_data() -> None:
 
 
 def apply_table_comments() -> None:
+    """仅在表注释不一致时 ALTER；避免每次启动抢元数据锁导致卡死。"""
     with get_connection() as connection:
         with connection.cursor() as cursor:
+            # 有长事务时不要无限等待（常见于上传脚本持锁）
+            cursor.execute("SET SESSION lock_wait_timeout = 5")
             for table_name, comment in TABLE_COMMENTS.items():
                 cursor.execute(
                     """
-                    SELECT COUNT(*) FROM information_schema.tables
+                    SELECT TABLE_COMMENT
+                    FROM information_schema.tables
                     WHERE table_schema = DATABASE() AND table_name = %s
                     """,
                     (table_name,),
                 )
-                if cursor.fetchone()[0]:
-                    escaped = comment.replace("'", "''")
+                row = cursor.fetchone()
+                if not row:
+                    continue
+                if (row[0] or "") == comment:
+                    continue
+                escaped = comment.replace("'", "''")
+                try:
                     cursor.execute(f"ALTER TABLE `{table_name}` COMMENT = '{escaped}'")
+                except Exception:
+                    # 注释更新失败不应阻断服务启动
+                    pass
 
 
 DROP_TABLES = LEGACY_TABLES

@@ -114,6 +114,21 @@ def _safe_sku_segment(value: str) -> str:
     return text[:64] or "item"
 
 
+def sniff_image_format(data: bytes) -> tuple[str, str] | None:
+    """根据文件头识别真实图片格式，返回 (content_type, extension)。"""
+    if not data or len(data) < 12:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg", ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None
+
+
 def rehost_image_urls(
     image_urls: list[str],
     *,
@@ -152,12 +167,18 @@ def rehost_image_urls(
                 (".jpg", ".jpeg", ".png", ".webp")
             ):
                 raise OssError(f"不是图片内容: {content_type}")
-            ext = _guess_extension(source, content_type)
+            sniffed = sniff_image_format(response.content)
+            if sniffed:
+                content_type, ext = sniffed
+            else:
+                ext = _guess_extension(source, content_type)
+                if not content_type.startswith("image/"):
+                    content_type = "image/jpeg"
             key = f"products/{sku_part}/{index + 1}-{uuid.uuid4().hex[:8]}{ext}"
             public_url = client.upload_bytes(
                 key=key,
                 data=response.content,
-                content_type=content_type if content_type.startswith("image/") else "image/jpeg",
+                content_type=content_type,
             )
             uploaded.append(public_url)
         except Exception as exc:
@@ -169,6 +190,21 @@ def rehost_image_urls(
     return {"images": uploaded, "errors": errors, "count": len(uploaded)}
 
 
+def sniff_image_format(data: bytes) -> tuple[str, str] | None:
+    """根据文件头识别真实图片格式，返回 (content_type, extension)。"""
+    if not data or len(data) < 12:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg", ".jpg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png", ".png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif", ".gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp", ".webp"
+    return None
+
+
 def upload_local_images(
     files: list[tuple[str, bytes, str]],
     *,
@@ -177,6 +213,7 @@ def upload_local_images(
     """
     上传本地图片字节到 OSS。
     files: [(filename, data, content_type), ...]
+    会按文件头纠正 MIME/扩展名，避免 .png 实为 JPEG 导致 Ozon 无法解析。
     """
     client = AliyunOssClient()
     client.ensure_configured()
@@ -190,17 +227,23 @@ def upload_local_images(
         if not data:
             errors.append({"file": name, "error": "空文件"})
             continue
-        if raw_type and not raw_type.startswith("image/"):
-            lower = name.lower()
-            if not lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
-                errors.append({"file": name, "error": f"不支持的类型: {raw_type or 'unknown'}"})
-                continue
-            raw_type = "image/jpeg"
+        sniffed = sniff_image_format(data)
+        if sniffed:
+            raw_type, ext = sniffed
+            stem = os.path.splitext(os.path.basename(name))[0] or "image"
+            name = f"{stem}{ext}"
+        else:
+            if raw_type and not raw_type.startswith("image/"):
+                lower = name.lower()
+                if not lower.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+                    errors.append({"file": name, "error": f"不支持的类型: {raw_type or 'unknown'}"})
+                    continue
+                raw_type = "image/jpeg"
+            ext = _guess_extension(name, raw_type)
         if len(data) > 12 * 1024 * 1024:
             errors.append({"file": name, "error": "单张图片不能超过 12MB"})
             continue
         try:
-            ext = _guess_extension(name, raw_type)
             key = f"products/{sku_part}/local-{index + 1}-{uuid.uuid4().hex[:10]}{ext}"
             public_url = client.upload_bytes(key=key, data=data, content_type=raw_type)
             uploaded.append(public_url)
@@ -211,3 +254,4 @@ def upload_local_images(
         raise OssError("没有成功上传任何图片：" + (errors[0]["error"] if errors else "空列表"))
 
     return {"images": uploaded, "errors": errors, "count": len(uploaded)}
+

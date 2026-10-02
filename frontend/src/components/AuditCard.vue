@@ -34,7 +34,7 @@ export interface AuditCardModel {
   supplierPrice?: string | null;
   matchScore?: number | null;
   packageManual: boolean;
-  aspect: "color" | "size";
+  aspect: "color" | "size" | "both";
   depthMm: number;
   widthMm: number;
   heightMm: number;
@@ -68,7 +68,7 @@ export interface AuditSavePayload {
     net_height_mm: number | null;
   }>;
   images: string[];
-  variant_aspect: "color" | "size";
+  variant_aspect: "color" | "size" | "both";
 }
 
 const props = defineProps<{
@@ -102,7 +102,7 @@ const form = reactive({
   netWidth: null as number | null,
   netHeight: null as number | null,
   images: [] as string[],
-  aspect: "color" as "color" | "size",
+  aspect: "color" as "color" | "size" | "both",
   variants: [] as AuditVariant[],
 });
 
@@ -400,9 +400,10 @@ function onPrimary(): void {
         <p v-if="packageWeightHint" class="audit-warn">{{ packageWeightHint }}</p>
 
         <div class="audit-aspect">
-          <span>合卡区分属性（双轴时建议用颜色，值已含「款式 · 尺码」）</span>
+          <span>合卡区分属性（双轴商品请选「颜色+尺码」，两侧都会写入 Ozon）</span>
           <button type="button" :class="{ active: form.aspect === 'color' }" @click="form.aspect = 'color'">颜色/款式</button>
           <button type="button" :class="{ active: form.aspect === 'size' }" @click="form.aspect = 'size'">尺码</button>
+          <button type="button" :class="{ active: form.aspect === 'both' }" @click="form.aspect = 'both'">颜色+尺码</button>
         </div>
 
         <p class="audit-section">

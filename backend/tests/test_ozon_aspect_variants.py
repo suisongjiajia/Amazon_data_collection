@@ -240,6 +240,104 @@ def test_size_aspect_writes_distinct_sleeve_length(monkeypatch):
     assert short_by_id[9048]["values"][0]["value"] == long_by_id[9048]["values"][0]["value"]
 
 
+def test_both_aspect_writes_color_and_steps(monkeypatch):
+    """宠物梯子类：颜色 + 阶数双轴必须同时写入。"""
+    from services import ozon_attribute_fill as fill
+
+    schema = [
+        {"id": 10097, "name": "Название цвета", "is_aspect": True, "type": "String", "dictionary_id": 0},
+        {"id": 10096, "name": "Цвет товара", "is_aspect": True, "type": "String", "dictionary_id": 1494},
+        {"id": 9533, "name": "Размер", "is_aspect": True, "type": "String", "dictionary_id": 0},
+        {"id": 9048, "name": "Название модели", "is_aspect": False, "type": "String", "dictionary_id": 0},
+    ]
+    monkeypatch.setattr(fill, "fetch_category_attributes", lambda *_a, **_k: schema)
+
+    def fake_pick(**kwargs):
+        q = " ".join(str(x) for x in (kwargs.get("queries") or []))
+        if "син" in q.lower() or "蓝" in q:
+            return {"dictionary_value_id": 61570, "value": "синий"}
+        return {"dictionary_value_id": 61576, "value": "серый"}
+
+    monkeypatch.setattr(fill, "pick_dictionary_value", fake_pick)
+    base = [
+        {"id": 9048, "values": [{"value": "Лестница-пандус"}]},
+        {"id": 10097, "values": [{"value": "серый"}]},
+        {"id": 10096, "values": [{"dictionary_value_id": 61576}]},
+        {"id": 9533, "values": [{"value": "3 ступени"}]},
+    ]
+    blue3 = fill.apply_variant_distinguishing_attributes(
+        base,
+        description_category_id=1,
+        type_id=2,
+        variant_attributes={"颜色": "蓝色", "尺码": "3层"},
+        edit_title="Лестница синяя 3 ступени",
+        variant_aspect="both",
+    )
+    by_id = {int(item["id"]): item for item in blue3}
+    assert by_id[10096]["values"][0]["dictionary_value_id"] == 61570
+    assert "син" in by_id[10097]["values"][0]["value"].lower() or by_id[10097]["values"][0]["value"]
+    assert by_id[9533]["values"][0]["value"] == "3 ступени"
+
+
+def test_detect_and_enrich_dual_aspect():
+    from services.ozon_attribute_fill import (
+        detect_variant_aspect_mode,
+        enrich_variant_aspect_fields,
+        infer_color_label,
+        listing_size_label,
+        resolve_variant_aspect_pair,
+    )
+
+    assert listing_size_label("3层") == "3 ступени"
+    assert listing_size_label("三层缓步楼梯（灰色）高30CM") == "3 ступени"
+    assert listing_size_label("灰色三阶直角【高30CM】") == "3 ступени"
+    assert listing_size_label("蓝色 · 5层") == "5 ступени"
+    assert listing_size_label("чехол 3 ступени") == "чехол 3 ступени"
+    assert listing_size_label("可拆洗布套（三层/不含楼梯）") == "чехол 3 ступени"
+    assert listing_size_label("只是单独换洗外套（不含填充物楼梯） / 灰色三阶直角【高30CM】") == "чехол 3 ступени"
+    from services.ozon_attribute_fill import resolve_variant_aspect_pair
+
+    stair = resolve_variant_aspect_pair(
+        {"规格": "25D高弹海绵/可拆洗/宠物楼梯 / 灰色三阶直角【高30CM】"},
+        title="Сменный чехол серый, 3 ступени",
+    )
+    assert stair == ("серый", "3 ступени")
+    cover = resolve_variant_aspect_pair(
+        {"规格": "只是单独换洗外套（不含填充物楼梯） / 灰色三阶直角【高30CM】"},
+        title="Серый, 3 ступени",
+    )
+    assert cover == ("серый чехол", "чехол 3 ступени")
+    enriched = enrich_variant_aspect_fields(
+        {
+            "规格": "只是单独换洗外套（不含填充物楼梯） / 灰色三阶直角【高30CM】",
+            "Название цвета": "серый чехол",
+            "Размер": "чехол 3 ступени",
+            "颜色": "серый чехол",
+            "尺码": "чехол 3 ступени",
+        }
+    )
+    assert enriched.get("Размер") == "чехол 3 ступени"
+    assert infer_color_label("深灰色三层楼梯") == "тёмно-серый"
+    assert infer_color_label("灰色三层楼梯") == "серый"
+    assert infer_color_label("тёмно-серый") == "тёмно-серый"
+    assert infer_color_label("黄绿四层") == "жёлто-зелёный"
+    enriched = enrich_variant_aspect_fields({"区分项": "灰色 · 4层"})
+    assert "灰" in enriched.get("颜色", "") or enriched.get("颜色")
+    assert enriched.get("Размер") == "4 ступени"
+    variants = [
+        {"variant_attributes": {"颜色": "蓝色", "尺码": "3层"}},
+        {"variant_attributes": {"颜色": "灰色", "尺码": "5层"}},
+        {"variant_attributes": {"颜色": "米色", "尺码": "4层"}},
+    ]
+    assert detect_variant_aspect_mode(variants) == "both"
+    assert detect_variant_aspect_mode(
+        [
+            {"variant_attributes": {"颜色": "蓝色"}},
+            {"variant_attributes": {"颜色": "灰色"}},
+        ]
+    ) == "color"
+
+
 def test_drop_variants_that_are_other_shop_products():
     from services.ozon_collection_service import drop_variants_listed_as_other_products
 
@@ -267,11 +365,29 @@ def test_drop_variants_that_are_other_shop_products():
 
 
 def test_listing_color_drops_chinese_and_uses_russian_title():
-    from services.ozon_attribute_fill import listing_color_label
+    from services.ozon_attribute_fill import listing_color_label, listing_size_label, parse_packed_color_size
 
     assert listing_color_label("带三个孔和鹿角的隧道", "Тоннель-лежак 85 см, серый") == "серый"
     assert listing_color_label("三孔绿色蘑菇隧道", "Тоннель-лежак, зеленый") == "зеленый"
     assert listing_color_label("серый", "зеленый") == "серый"
+    assert listing_color_label("清新绿-耐磨 · XL75*60cm（建议30斤内）") == "зеленый"
+    assert listing_size_label("清新绿 · L 60*50cm（建议15斤内）") == "L 60x50"
+    assert listing_size_label("L 60*50cm（建议15斤内犬猫）") == "L 60x50"
+    assert parse_packed_color_size("灰色S(40*50)CM") == ("灰色", "S 40x50")
+    assert parse_packed_color_size("咖色XL(66*90)CM") == ("咖色", "XL 66x90")
+    assert listing_color_label("灰色S(40*50)CM") == "серый"
+    assert listing_size_label("灰色S(40*50)CM") == "S 40x50"
+    assert listing_color_label("咖色M(48*60)CM") == "коричневый"
+    assert listing_size_label("咖色M(48*60)CM") == "M 48x60"
+
+
+def test_size_label_to_mm_and_packed_specs():
+    from services.ozon_attribute_fill import listing_aspect_size_mm, size_label_to_mm
+
+    assert size_label_to_mm("S 40x50") == "400*500*80"
+    assert size_label_to_mm("XL 66x90") == "660*900*80"
+    assert listing_aspect_size_mm("灰色S(40*50)CM") == "400*500*80"
+    assert listing_aspect_size_mm("咖色XL(66*90)CM") == "660*900*80"
 
 
 def test_same_gray_tunnels_get_distinct_color_names():

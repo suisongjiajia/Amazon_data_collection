@@ -172,7 +172,12 @@ function modelFor(edit: ProductEdit): AuditCardModel {
     supplierPrice: supplier?.price_text || null,
     matchScore: supplier?.match_score ?? null,
     packageManual: manual,
-    aspect: String(attrs.variant_aspect || "") === "size" ? "size" : "color",
+    aspect:
+      String(attrs.variant_aspect || "") === "size"
+        ? "size"
+        : String(attrs.variant_aspect || "") === "both"
+          ? "both"
+          : "color",
     depthMm: manual ? positiveInt(attrText(attrs, ["Длина, мм", "depth_mm", "length_mm"], "100"), 100) : 100,
     widthMm: manual ? positiveInt(attrText(attrs, ["Ширина, мм", "width_mm"], "100"), 100) : 100,
     heightMm: manual ? positiveInt(attrText(attrs, ["Высота, мм", "height_mm"], "100"), 100) : 100,

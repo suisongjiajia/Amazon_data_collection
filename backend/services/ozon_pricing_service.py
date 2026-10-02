@@ -238,8 +238,24 @@ def suggest_price_for_family(raw_product_family_id: int) -> dict[str, Any]:
         else:
             weight_assumed = False
 
+    depth_mm = _parse_mm(attributes.get("depth_mm") or attributes.get("Длина, мм"))
+    width_mm = _parse_mm(attributes.get("width_mm") or attributes.get("Ширина, мм"))
+    height_mm = _parse_mm(attributes.get("height_mm") or attributes.get("Высота, мм"))
+    if str(family.get("platform") or "") == "1688":
+        raw = family.get("raw_payload") if isinstance(family.get("raw_payload"), dict) else {}
+        nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else {}
+        metrics = nested.get("package_metrics") if isinstance(nested.get("package_metrics"), dict) else {}
+        depth_mm = depth_mm or _parse_mm(metrics.get("depth_mm"))
+        width_mm = width_mm or _parse_mm(metrics.get("width_mm"))
+        height_mm = height_mm or _parse_mm(metrics.get("height_mm"))
+
     try:
-        freight_info = calc_xingyuan_economy_freight_cny(weight_g)
+        freight_info = calc_xingyuan_economy_freight_cny(
+            weight_g,
+            depth_mm=depth_mm,
+            width_mm=width_mm,
+            height_mm=height_mm,
+        )
     except FreightError as exc:
         raise ValueError(str(exc)) from exc
 
@@ -273,4 +289,102 @@ def suggest_price_for_family(raw_product_family_id: int) -> dict[str, Any]:
             f"渠道 {freight_info['channel_name']}；库存默认 {pricing['stock_qty']}"
             + ("；重量为默认估算，请核对" if weight_assumed else "")
         ),
+    }
+
+
+def _parse_mm(value: Any) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        number = int(round(float(str(value).replace(",", "."))))
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def suggest_price_for_package(
+    *,
+    supplier_price_cny: float,
+    depth_mm: int,
+    width_mm: int,
+    height_mm: int,
+    weight_g: float,
+) -> dict[str, Any]:
+    """按包装尺寸优先选物流档，再算建议售价。"""
+    freight_info = calc_xingyuan_economy_freight_cny(
+        weight_g,
+        depth_mm=int(depth_mm),
+        width_mm=int(width_mm),
+        height_mm=int(height_mm),
+    )
+    pricing = calc_suggested_price_rub(
+        supplier_price_cny=float(supplier_price_cny),
+        freight_cny=float(freight_info["freight_cny"]),
+    )
+    return {
+        "supplier_price_cny": round(float(supplier_price_cny), 2),
+        "depth_mm": int(depth_mm),
+        "width_mm": int(width_mm),
+        "height_mm": int(height_mm),
+        "weight_g": int(freight_info["weight_g"]),
+        "actual_weight_g": int(freight_info.get("actual_weight_g") or weight_g),
+        "freight": freight_info,
+        "pricing": pricing,
+    }
+
+
+def write_package_fields(
+    target: dict[str, Any],
+    *,
+    depth_mm: int,
+    width_mm: int,
+    height_mm: int,
+    weight_g: int,
+) -> dict[str, Any]:
+    out = dict(target or {})
+    d, w, h, wt = int(depth_mm), int(width_mm), int(height_mm), int(weight_g)
+    out["depth_mm"] = str(d)
+    out["width_mm"] = str(w)
+    out["height_mm"] = str(h)
+    out["length_mm"] = str(d)
+    out["weight_g"] = str(wt)
+    out["weight"] = str(wt)
+    out["Длина, мм"] = str(d)
+    out["Ширина, мм"] = str(w)
+    out["Высота, мм"] = str(h)
+    out["Вес, г"] = str(wt)
+    out["Вес товара, г"] = str(wt)
+    out["Вес с упаковкой, г"] = str(wt)
+    out["Размеры, мм"] = f"{d}*{w}*{h}"
+    out["Размер упаковки (Длина х Ширина х Высота), см"] = (
+        f"{max(1, round(d / 10))}x{max(1, round(w / 10))}x{max(1, round(h / 10))}"
+    )
+    out["package_manual"] = "1"
+    return out
+
+
+def is_placeholder_dims(
+    depth_mm: int | None,
+    width_mm: int | None,
+    height_mm: int | None,
+) -> bool:
+    """统一假尺寸立方体（旧默认 100/200mm），不能当真实包装。"""
+    if not (depth_mm and width_mm and height_mm):
+        return True
+    return (int(depth_mm), int(width_mm), int(height_mm)) in {(100, 100, 100), (200, 200, 200)}
+
+
+def is_placeholder_package(
+    depth_mm: int | None,
+    width_mm: int | None,
+    height_mm: int | None,
+    weight_g: int | None,
+) -> bool:
+    if not (depth_mm and width_mm and height_mm and weight_g):
+        return True
+    if is_placeholder_dims(depth_mm, width_mm, height_mm):
+        return True
+    return (int(depth_mm), int(width_mm), int(height_mm), int(weight_g)) in {
+        (100, 100, 100, 200),
+        (200, 200, 200, 200),
     }

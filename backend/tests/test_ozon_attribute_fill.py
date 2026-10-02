@@ -39,10 +39,58 @@ def test_pick_dictionary_by_type_id():
         description_category_id=83250454,
         type_id=971107021,
         queries=["ракель"],
+        attribute_name="Тип",
     )
     assert picked is not None
     assert picked["dictionary_value_id"] == 971107021
     assert picked["source"] == "type_id_match"
+
+
+def test_pick_dictionary_ignores_type_id_for_non_type_attrs():
+    client = _FakeClient(
+        values=[
+            {"id": 971107021, "value": "Ракель"},
+            {"id": 2, "value": "Без наполнителя"},
+        ]
+    )
+    picked = pick_dictionary_value(
+        client=client,
+        attribute_id=100,
+        description_category_id=1,
+        type_id=971107021,
+        queries=["Без наполнителя"],
+        attribute_name="Наполнитель лежака/домика для животных",
+    )
+    assert picked is not None
+    assert picked["dictionary_value_id"] == 2
+    assert picked["value"] == "Без наполнителя"
+
+
+def test_cooling_filler_and_skip_shelf_life_and_pet_size_queries():
+    from services.ozon_attribute_fill import (
+        _heuristic_attr_value,
+        _is_animal_size_attr,
+        _is_shelf_life_attr,
+        _pet_size_search_queries,
+        _looks_like_cooling_or_hard_shell,
+    )
+
+    assert _is_shelf_life_attr("Срок годности, дней")
+    assert _is_animal_size_attr("Размер животного")
+    assert not _is_animal_size_attr("Размеры, мм")
+    assert _looks_like_cooling_or_hard_shell(
+        "Летний лежак из ротанга, охлаждающая подстилка"
+    )
+    filler = _heuristic_attr_value(
+        "Наполнитель лежака/домика для животных",
+        edit_attributes={},
+        edit_title="Летний лежак-домик охлаждающая подстилка из ротанга",
+        description="",
+    )
+    assert filler is None
+    queries = _pet_size_search_queries("清新绿 · M 41*50cm（建议15斤内）")
+    assert "M" in queries
+    assert any("до" in q and "кг" in q for q in queries)
 
 
 def test_pick_dictionary_by_search():

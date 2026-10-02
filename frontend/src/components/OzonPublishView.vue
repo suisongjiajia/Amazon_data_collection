@@ -5,7 +5,7 @@ import { apiRequest } from "../lib/api";
 import { useAppStore } from "../composables/useAppStore";
 import { getModuleDefinition } from "../config/modules";
 import type { ListingPreview, OzonPublishTask, ProductEdit } from "../types/ozon-workflow";
-import { resolveEditImage, resolveEditSubtitle, resolvePublishTaskImage, formatMoney, resolveCurrencyCode } from "../utils/product-display";
+import { resolvePublishTaskImage } from "../utils/product-display";
 import ErpBadge from "./erp/ErpBadge.vue";
 import ErpButton from "./erp/ErpButton.vue";
 import ErpCard from "./erp/ErpCard.vue";
@@ -21,12 +21,14 @@ const shopName = ref("演示店铺");
 const simulatePublish = ref(false);
 const selectedTaskId = ref<number | null>(null);
 const taskDetail = ref<OzonPublishTask | null>(null);
-const selectedEditId = ref<number | null>(null);
+const selectedTaskIds = ref<number[]>([]);
 const refreshing = ref(false);
+const batchBusy = ref(false);
 const publishingEditId = ref<number | null>(null);
 const reopeningEditId = ref<number | null>(null);
 const healingEditId = ref<number | null>(null);
 const republishingEditId = ref<number | null>(null);
+const batchProgress = ref("");
 
 const isPublishingBusy = computed(
   () =>
@@ -34,11 +36,8 @@ const isPublishingBusy = computed(
     reopeningEditId.value != null ||
     healingEditId.value != null ||
     republishingEditId.value != null ||
-    refreshing.value,
-);
-
-const approvedEdits = computed(() =>
-  store.state.value.edits.filter((item) => item.status === "approved"),
+    refreshing.value ||
+    batchBusy.value,
 );
 
 const failedTasks = computed(() =>
@@ -56,19 +55,29 @@ const pendingConfirmTasks = computed(() =>
   ),
 );
 
-const selectedEdit = computed(() =>
-  approvedEdits.value.find((item) => item.id === selectedEditId.value) ?? null,
+const allTaskIds = computed(() => store.state.value.publishTasks.map((task) => task.id));
+
+const allSelected = computed(
+  () =>
+    allTaskIds.value.length > 0 &&
+    allTaskIds.value.every((id) => selectedTaskIds.value.includes(id)),
+);
+
+const selectedTasks = computed(() =>
+  store.state.value.publishTasks.filter((task) => selectedTaskIds.value.includes(task.id)),
 );
 
 watch(
   () => store.state.value.publishTasks,
   (tasks) => {
+    const alive = new Set(tasks.map((task) => task.id));
+    selectedTaskIds.value = selectedTaskIds.value.filter((id) => alive.has(id));
     if (!tasks.length) {
       selectedTaskId.value = null;
       taskDetail.value = null;
       return;
     }
-    if (selectedTaskId.value == null) {
+    if (selectedTaskId.value == null || !alive.has(selectedTaskId.value)) {
       void openTask(tasks[0].id);
     }
   },
@@ -99,19 +108,6 @@ function publishStatusLabel(status: string): string | undefined {
   return undefined;
 }
 
-function blockingPublishTask(editId: number): OzonPublishTask | undefined {
-  const blocking = ["awaiting_pull", "submitted", "running", "processing", "pushed", "partial"];
-  return store.state.value.publishTasks
-    .filter((task) => task.edit_id === editId && blocking.includes(task.status))
-    .sort((a, b) => b.id - a.id)[0];
-}
-
-function blockingPublishLabel(task: OzonPublishTask | undefined): string {
-  if (!task) return "";
-  if (task.status === "pushed" || task.status === "partial") return "已推送，还不可售";
-  return "Ozon 处理中";
-}
-
 function resultLabel(task: OzonPublishTask): string {
   if (task.status === "awaiting_pull" || task.status === "submitted" || task.status === "running") {
     return `已提交，等 Ozon 处理 · ${task.total_count} SKU`;
@@ -126,6 +122,20 @@ function resultLabel(task: OzonPublishTask): string {
     return `推送失败 ${task.fail_count}/${task.total_count}`;
   }
   return `${task.success_count} 成功 / ${task.fail_count} 其它 / ${task.total_count}`;
+}
+
+function toggleTask(taskId: number, checked: boolean): void {
+  if (checked) {
+    if (!selectedTaskIds.value.includes(taskId)) {
+      selectedTaskIds.value = [...selectedTaskIds.value, taskId];
+    }
+    return;
+  }
+  selectedTaskIds.value = selectedTaskIds.value.filter((id) => id !== taskId);
+}
+
+function toggleSelectAll(checked: boolean): void {
+  selectedTaskIds.value = checked ? [...allTaskIds.value] : [];
 }
 
 async function publish(editId: number): Promise<void> {
@@ -167,15 +177,18 @@ async function openTask(taskId: number): Promise<void> {
   }
 }
 
+async function refreshOne(taskId: number): Promise<OzonPublishTask> {
+  return apiRequest<OzonPublishTask>(`/api/ozon/publish-tasks/${taskId}/refresh-status`, {
+    method: "POST",
+  });
+}
+
 async function refreshStatus(): Promise<void> {
   if (selectedTaskId.value == null || refreshing.value) return;
   refreshing.value = true;
   store.showNotice("正在拉取上架状态…");
   try {
-    const task = await apiRequest<OzonPublishTask>(
-      `/api/ozon/publish-tasks/${selectedTaskId.value}/refresh-status`,
-      { method: "POST" },
-    );
+    const task = await refreshOne(selectedTaskId.value);
     taskDetail.value = task;
     if (task.status === "listed" || task.status === "completed") {
       store.showNotice("拉取完成：上架成功（可售）");
@@ -195,10 +208,6 @@ async function refreshStatus(): Promise<void> {
   } finally {
     refreshing.value = false;
   }
-}
-
-function selectApproved(edit: ProductEdit): void {
-  selectedEditId.value = edit.id;
 }
 
 async function reopenEdit(editId: number): Promise<void> {
@@ -262,6 +271,113 @@ async function republishListed(editId: number): Promise<void> {
     await store.refreshAll();
   } finally {
     republishingEditId.value = null;
+  }
+}
+
+async function runBatch(
+  label: string,
+  tasks: OzonPublishTask[],
+  worker: (task: OzonPublishTask) => Promise<void>,
+): Promise<void> {
+  if (!tasks.length || batchBusy.value) return;
+  batchBusy.value = true;
+  const total = tasks.length;
+  let ok = 0;
+  let done = 0;
+  const errors: string[] = [];
+  batchProgress.value = `${label}：0/${total}`;
+  store.showNotice(`${label}：0/${total}…`);
+  try {
+    for (const task of tasks) {
+      const tip = `${task.task_no || `#${task.id}`}`;
+      batchProgress.value = `${label}：${done}/${total} · 进行中 ${tip}`;
+      store.showNotice(`${label}：${done + 1}/${total} · ${tip}`);
+      try {
+        await worker(task);
+        ok += 1;
+      } catch (err) {
+        errors.push(`${task.task_no}: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      done += 1;
+      batchProgress.value = `${label}：${done}/${total} · 成功 ${ok} · 失败 ${errors.length}`;
+      store.showNotice(batchProgress.value);
+    }
+    await store.refreshAll();
+    if (selectedTaskId.value != null) {
+      await openTask(selectedTaskId.value);
+    }
+    if (errors.length) {
+      store.showError(`${label}完成：成功 ${ok}/${total}，失败 ${errors.length}。${errors[0]}`);
+    } else {
+      store.showNotice(`${label}完成：全部 ${ok} 条成功`);
+    }
+  } finally {
+    batchBusy.value = false;
+    batchProgress.value = "";
+  }
+}
+
+async function batchRefresh(): Promise<void> {
+  const tasks = selectedTasks.value.filter((task) => canRefresh(task));
+  await runBatch("批量拉取状态", tasks, async (task) => {
+    const updated = await refreshOne(task.id);
+    if (selectedTaskId.value === task.id) {
+      taskDetail.value = updated;
+    }
+  });
+}
+
+async function batchRepublish(): Promise<void> {
+  const tasks = selectedTasks.value.filter(
+    (task) => task.status === "failed" || task.status === "pushed" || task.status === "partial",
+  );
+  await runBatch("批量再次推送", tasks, async (task) => {
+    await apiRequest<OzonPublishTask>("/api/ozon/publish-tasks", {
+      method: "POST",
+      body: JSON.stringify({
+        edit_id: task.edit_id,
+        shop_name: shopName.value,
+        simulate: simulatePublish.value,
+        auto_follow: !simulatePublish.value,
+      }),
+    });
+  });
+}
+
+async function batchHeal(): Promise<void> {
+  const tasks = selectedTasks.value.filter(
+    (task) => task.status === "failed" || task.status === "pushed" || task.status === "partial",
+  );
+  await runBatch("批量 AI 修复", tasks, async (task) => {
+    await apiRequest(`/api/ozon/publish-tasks/ai-heal/${task.edit_id}`, { method: "POST" });
+  });
+}
+
+async function batchReopen(): Promise<void> {
+  const tasks = selectedTasks.value;
+  const uniqueEditIds = [...new Set(tasks.map((task) => task.edit_id))];
+  if (!uniqueEditIds.length || batchBusy.value) return;
+  batchBusy.value = true;
+  const total = uniqueEditIds.length;
+  batchProgress.value = `批量回编辑：0/${total}`;
+  store.showNotice(`批量回编辑：0/${total}…`);
+  try {
+    let done = 0;
+    for (const editId of uniqueEditIds) {
+      store.showNotice(`批量回编辑：${done + 1}/${total} · edit #${editId}`);
+      batchProgress.value = `批量回编辑：${done + 1}/${total}`;
+      await apiRequest(`/api/ozon/publish-tasks/reopen-edit/${editId}`, { method: "POST" });
+      done += 1;
+      batchProgress.value = `批量回编辑：${done}/${total}`;
+    }
+    store.showNotice(`批量回编辑完成：${total} 个商品已退回审核中心`);
+    store.setModule("review");
+    await store.refreshAll();
+  } catch (err) {
+    store.showError(err instanceof Error ? err.message : String(err));
+  } finally {
+    batchBusy.value = false;
+    batchProgress.value = "";
   }
 }
 
@@ -329,7 +445,6 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
     if (item.status !== "failed") continue;
     const detail = [item.error_code, item.error_message].filter(Boolean).join(" · ");
     if (!detail) continue;
-    // 任务级已汇总时避免重复刷屏
     if (task.error_message && task.error_message.includes(detail)) continue;
     issues.push({
       code: item.error_code || "ITEM_IMPORT_ERROR",
@@ -364,9 +479,9 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
 
     <ErpStatGrid
       :items="[
-        { label: '可发布', value: approvedEdits.length, hint: '已通过审核' },
+        { label: '发布任务', value: store.state.value.publishTasks.length, hint: '全部任务' },
         { label: '待拉取/已推送', value: pendingConfirmTasks.length, hint: '需拉取确认可售' },
-        { label: '推送失败', value: failedTasks.length, hint: '需修复再推' },
+        { label: '推送失败', value: failedTasks.length, hint: '可批量修复再推' },
       ]"
     />
 
@@ -382,130 +497,65 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
         </label>
       </div>
       <p class="erp-detail-text">
-        状态说明：点「推送到 Ozon」后，任务是「Ozon 处理中」，这时上面不再出现推送按钮。拉取后有档案但不可售→「已推送，还不可售」；确认可售→「上架成功」；推送时报错→「推送失败」。
-        拉取时会调用 `/v1/barcode/generate` 生成条码，并尝试推 rFBS 库存。
+        在「发布任务」勾选多条后可批量拉取状态、再次推送、AI 修复或回编辑。单个任务仍可在右侧详情操作。
       </p>
     </ErpCard>
 
-    <div class="publish-top-layout">
-      <ErpCard title="可发布 Listing" :description="`${approvedEdits.length} 条 · 点行查看商品`" padding="none">
-        <div v-if="approvedEdits.length" class="erp-table-wrap">
-          <table class="erp-table">
-            <thead>
-              <tr>
-                <th>商品</th>
-                <th>状态</th>
-                <th>操作</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr
-                v-for="edit in approvedEdits"
-                :key="edit.id"
-                class="is-clickable"
-                :class="{ 'is-selected': edit.id === selectedEditId }"
-                @click="selectApproved(edit)"
-              >
-                <td>
-                  <ErpProductCell
-                    :image-url="resolveEditImage(edit)"
-                    :title="edit.title"
-                    :subtitle="resolveEditSubtitle(edit)"
-                  />
-                </td>
-                <td><ErpBadge :status="edit.status" :label="blockingPublishTask(edit.id) ? blockingPublishLabel(blockingPublishTask(edit.id)) : undefined" /></td>
-                <td @click.stop>
-                  <div class="erp-table-actions">
-                    <ErpButton
-                      v-if="blockingPublishTask(edit.id)"
-                      size="sm"
-                      disabled
-                    >
-                      {{ blockingPublishLabel(blockingPublishTask(edit.id)) }}
-                    </ErpButton>
-                    <ErpButton
-                      v-else
-                      size="sm"
-                      :disabled="isPublishingBusy || store.loading.value"
-                      @click="publish(edit.id)"
-                    >
-                      {{ publishingEditId === edit.id ? "推送中…" : "推送到 Ozon" }}
-                    </ErpButton>
-                    <ErpButton
-                      size="sm"
-                      variant="ghost"
-                      :disabled="isPublishingBusy"
-                      @click="reopenEdit(edit.id)"
-                    >
-                      {{ reopeningEditId === edit.id ? "打开中…" : "回编辑" }}
-                    </ErpButton>
-                  </div>
-                </td>
-              </tr>
-            </tbody>
-          </table>
-        </div>
-        <ErpEmpty v-else message="暂无已通过审核的 Listing" />
-      </ErpCard>
-
-      <ErpCard title="选中商品详情" description="确认主图与价格后再推送">
-        <template v-if="selectedEdit">
-          <div class="erp-detail-hero">
-            <ErpProductCell
-              size="lg"
-              :image-url="resolveEditImage(selectedEdit)"
-              :title="selectedEdit.title"
-              :subtitle="resolveEditSubtitle(selectedEdit)"
-            />
-            <div class="erp-detail-hero__copy">
-              <div class="erp-detail-hero__meta">
-                <ErpBadge :status="selectedEdit.status" />
-                <span v-if="selectedEdit.family_external_id">Ozon ID {{ selectedEdit.family_external_id }}</span>
-                <span v-if="selectedEdit.category_name">{{ selectedEdit.category_name }}</span>
-              </div>
-              <p v-if="selectedEdit.family_title" class="erp-detail-text">源品：{{ selectedEdit.family_title }}</p>
-              <p class="erp-detail-text">{{ selectedEdit.description || "暂无描述" }}</p>
-            </div>
-          </div>
-          <div v-if="selectedEdit.images?.length" class="erp-image-strip" style="margin-top: 12px">
-            <img
-              v-for="(img, i) in selectedEdit.images"
-              :key="`${img}-${i}`"
-              :src="img"
-              alt="商品图"
-            />
-          </div>
-          <div class="erp-table-wrap" style="margin-top: 12px">
-            <table class="erp-table">
-              <thead>
-                <tr>
-                <th>SKU</th>
-                <th>标题</th>
-                <th>价格</th>
-                <th>库存</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="variant in selectedEdit.variants" :key="variant.id">
-                  <td>{{ variant.sku }}</td>
-                  <td>{{ variant.title || "-" }}</td>
-                  <td>{{ formatMoney(variant.price, resolveCurrencyCode(selectedEdit.attributes)) }}</td>
-                  <td>{{ variant.quantity }}</td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-        </template>
-        <ErpEmpty v-else message="点击左侧可发布商品查看详情" />
-      </ErpCard>
-    </div>
-
     <div class="publish-layout">
-      <ErpCard title="发布任务" :description="`${store.state.value.publishTasks.length} 条`" padding="none">
+      <ErpCard
+        title="发布任务"
+        :description="`${store.state.value.publishTasks.length} 条 · 已选 ${selectedTaskIds.length}`"
+        padding="none"
+      >
+        <div v-if="store.state.value.publishTasks.length" class="batch-bar">
+          <label class="batch-check">
+            <input
+              type="checkbox"
+              :checked="allSelected"
+              :disabled="isPublishingBusy"
+              @change="toggleSelectAll(($event.target as HTMLInputElement).checked)"
+            />
+            全选
+          </label>
+          <span v-if="batchProgress" class="batch-progress">{{ batchProgress }}</span>
+          <span v-else class="batch-progress batch-progress--idle">已选 {{ selectedTaskIds.length }}</span>
+          <ErpButton
+            size="sm"
+            variant="secondary"
+            :disabled="isPublishingBusy || !selectedTaskIds.length"
+            @click="batchRefresh"
+          >
+            批量拉取状态
+          </ErpButton>
+          <ErpButton
+            size="sm"
+            variant="secondary"
+            :disabled="isPublishingBusy || !selectedTaskIds.length"
+            @click="batchRepublish"
+          >
+            批量再次推送
+          </ErpButton>
+          <ErpButton
+            size="sm"
+            :disabled="isPublishingBusy || !selectedTaskIds.length"
+            @click="batchHeal"
+          >
+            批量 AI 修复
+          </ErpButton>
+          <ErpButton
+            size="sm"
+            variant="ghost"
+            :disabled="isPublishingBusy || !selectedTaskIds.length"
+            @click="batchReopen"
+          >
+            批量回编辑
+          </ErpButton>
+        </div>
         <div v-if="store.state.value.publishTasks.length" class="erp-table-wrap">
           <table class="erp-table">
             <thead>
               <tr>
+                <th class="col-check"></th>
                 <th>商品</th>
                 <th>状态</th>
                 <th>结果</th>
@@ -519,6 +569,14 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
                 :class="{ 'is-selected': task.id === selectedTaskId }"
                 @click="openTask(task.id)"
               >
+                <td class="col-check" @click.stop>
+                  <input
+                    type="checkbox"
+                    :checked="selectedTaskIds.includes(task.id)"
+                    :disabled="isPublishingBusy"
+                    @change="toggleTask(task.id, ($event.target as HTMLInputElement).checked)"
+                  />
+                </td>
                 <td>
                   <ErpProductCell
                     :image-url="resolvePublishTaskImage(task)"
@@ -637,12 +695,45 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
 </template>
 
 <style scoped>
-.publish-top-layout,
 .publish-layout {
   display: grid;
   grid-template-columns: minmax(300px, 1fr) minmax(340px, 1.1fr);
   gap: 16px;
   align-items: start;
+}
+
+.batch-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid rgba(15, 23, 42, 0.08);
+}
+
+.batch-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-right: 4px;
+  font-size: 13px;
+  color: #344054;
+}
+
+.batch-progress {
+  flex: 1 1 160px;
+  min-width: 120px;
+  font-size: 12px;
+  color: #027a48;
+  font-variant-numeric: tabular-nums;
+}
+
+.batch-progress--idle {
+  color: #667085;
+}
+
+.col-check {
+  width: 36px;
 }
 
 .erp-table tr.is-clickable {
@@ -663,7 +754,6 @@ function payloadPreview(task: OzonPublishTask): ListingPreview {
 }
 
 @media (max-width: 960px) {
-  .publish-top-layout,
   .publish-layout {
     grid-template-columns: 1fr;
   }

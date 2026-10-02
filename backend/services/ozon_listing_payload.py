@@ -24,7 +24,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 def force_package_metrics_enabled() -> bool:
-    raw = (os.getenv("OZON_FORCE_PACKAGE_METRICS") or "true").strip().lower()
+    # 默认关闭：必须用库里的真实包装尺寸，再按兴远尺寸档抬重量
+    raw = (os.getenv("OZON_FORCE_PACKAGE_METRICS") or "false").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -42,6 +43,184 @@ def package_is_manual(attributes: dict[str, Any] | None) -> bool:
     """审核中心手改过尺寸后，不再被全局默认值覆盖。"""
     flag = str((attributes or {}).get("package_manual") or "").strip().lower()
     return flag in {"1", "true", "yes", "on"}
+
+
+_CYRILLIC_RE = re.compile(r"[\u0400-\u04FF]")
+_SIZE_LETTER_RE = re.compile(r"\b(XXL|XL|XS|S|M|L)\b", re.I)
+_DIMS_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*[x×х*]\s*(\d+(?:[.,]\d+)?)",
+    re.I,
+)
+_DIMS_BLOCK_RE = re.compile(
+    r"(?:,\s*)?(?:размер\s*)?(?:XXL|XL|XS|S|M|L)?\s*"
+    r"\d+(?:[.,]\d+)?\s*[x×х*]\s*\d+(?:[.,]\d+)?(?:\s*[x×х*]\s*\d+(?:[.,]\d+)?)?"
+    r"\s*(?:см|cm|мм|mm)?",
+    re.I,
+)
+_WEIGHT_HINT_RE = re.compile(
+    r"\([^)]*(?:цзин|斤|кг|kg|до\s*\d+)[^)]*\)",
+    re.I,
+)
+
+
+def _cyrillic_count(text: str) -> int:
+    return len(_CYRILLIC_RE.findall(text or ""))
+
+
+def _strip_size_and_weight_noise(text: str) -> str:
+    """去掉名称中的尺寸/斤数提示，避免「70x100 … 30x40」双尺寸和「цзиней」。"""
+    cleaned = str(text or "")
+    cleaned = _WEIGHT_HINT_RE.sub("", cleaned)
+    cleaned = _DIMS_BLOCK_RE.sub("", cleaned)
+    cleaned = _SIZE_LETTER_RE.sub("", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned)
+    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
+    return cleaned.strip(" ,/;|-")
+
+
+def _extract_size_dims_cm(*texts: Any) -> str:
+    """提取「41x50 см」，不含拉丁尺码字母（避免 Ozon 名称拉丁/大写校验）。"""
+    from services.ozon_attribute_fill import listing_size_label
+
+    for raw in texts:
+        label = listing_size_label(raw) if raw else ""
+        for candidate in (label, str(raw or "")):
+            # 忽略明显的包装默认 10x10
+            matched = _DIMS_RE.search(candidate)
+            if matched:
+                try:
+                    a = int(float(matched.group(1).replace(",", ".")))
+                    b = int(float(matched.group(2).replace(",", ".")))
+                except ValueError:
+                    continue
+                if a <= 15 and b <= 15:
+                    continue
+                return f"{a}x{b} см"
+    return ""
+
+
+def build_ozon_item_name(
+    *,
+    variant_title: str,
+    edit_title: str,
+    color: str = "",
+    size_hint: str = "",
+    type_name: str = "",
+) -> str:
+    """
+    Ozon 商品名称规则：
+    - 必须以西里尔文为主，不能是拉丁字母串
+    - 不能有大量大写拉丁字母
+    - 只保留一套尺寸；类型词尽量与 type_name 一致
+    - 名称必须能体现 Тип（如 Лестница / Домик），否则会 DESCRIPTION_DECLINE
+    中文变体标题 strip 后会变成「M:41*50」，严禁直接提交。
+    """
+    from services.ozon_attribute_fill import contains_cjk, listing_color_label
+
+    def _has_type_signal(text: str, type_label: str) -> bool:
+        name_l = str(text or "").casefold()
+        type_l = str(type_label or "").casefold()
+        if not type_l:
+            return True
+        tokens = (
+            "лестниц",
+            "ступен",
+            "домик",
+            "лежак",
+            "подстилк",
+            "будка",
+            "гамак",
+            "тоннел",
+            "коврик",
+            "матрас",
+        )
+        type_tokens = [t for t in tokens if t in type_l]
+        if not type_tokens:
+            first = type_l.split()[0] if type_l.split() else ""
+            return bool(first and first in name_l)
+        return any(t in name_l for t in type_tokens)
+
+    type_l = str(type_name or "").strip()
+    base = ""
+    for cand in (variant_title, edit_title):
+        text = str(cand or "").strip()
+        if not text or contains_cjk(text):
+            continue
+        if _cyrillic_count(text) < 8:
+            continue
+        # 变体标题若只有颜色/尺码（无 лестница/домик），不能当主名称
+        if type_l and not _has_type_signal(text, type_l) and cand == variant_title:
+            continue
+        base = text
+        break
+    if not base:
+        for cand in (edit_title, type_l, "Лежанка для животных"):
+            text = str(cand or "").strip()
+            if text and not contains_cjk(text) and _cyrillic_count(text) >= 4:
+                base = text
+                break
+        if not base:
+            base = "Лежанка для животных"
+
+    base = _strip_size_and_weight_noise(base)
+    # 若有官方类型名，避免名称用冲突类型词（如 type=Лежак 却写 Будка）
+    if type_l:
+        conflict_pairs = (
+            (("будка",), ("лежак", "подстилк", "мат", "домик")),
+            (("домик",), ("будка",)),
+            (("автогамак", "гамак"), ("будка", "домик")),
+            (("лестниц",), ("домик", "гамак", "будка")),
+        )
+        base_l = base.casefold()
+        type_l_cf = type_l.casefold()
+        for type_tokens, name_tokens in conflict_pairs:
+            if any(t in type_l_cf for t in type_tokens) and any(t in base_l for t in name_tokens):
+                base = type_l
+                break
+            if any(t in type_l_cf for t in ("лежак", "подстилк")) and any(
+                t in base_l for t in ("будка",)
+            ):
+                base = type_l
+                break
+        # 最终兜底：名称仍无类型信号时，用类型名做主干
+        if not _has_type_signal(base, type_l):
+            base = type_l
+
+    color_ru = ""
+    if color:
+        color_ru = listing_color_label(color, variant_title, edit_title)
+    if color_ru and (contains_cjk(color_ru) or _cyrillic_count(color_ru) < 2):
+        color_ru = ""
+
+    # 尺寸只信任 size_hint（通常来自 规格），避免标题与规格两套尺寸拼在一起
+    dims = _extract_size_dims_cm(size_hint) or _extract_size_dims_cm(variant_title)
+    # 阶数也拼进名称，便于区分变体
+    steps = ""
+    step_match = re.search(r"(\d+)\s*ступен", f"{variant_title} {size_hint}", flags=re.I)
+    if step_match:
+        steps = f"{step_match.group(1)} ступени"
+
+    parts = [base]
+    if color_ru and color_ru.casefold() not in base.casefold():
+        parts.append(color_ru)
+    if steps and steps.casefold() not in " ".join(parts).casefold():
+        parts.append(steps)
+    if dims:
+        parts.append(dims)
+
+    name = ", ".join(p for p in parts if p)
+    name = _strip_size_and_weight_noise(name)
+    if dims and dims not in name:
+        name = f"{name}, {dims}" if name else dims
+    name = _SIZE_LETTER_RE.sub("", name)
+    name = "".join(ch.lower() if "A" <= ch <= "Z" else ch for ch in name)
+    name = re.sub(r"\s{2,}", " ", name)
+    name = re.sub(r"\s*,\s*", ", ", name).strip(" ,/")
+    if _cyrillic_count(name) < 8 or (type_l and not _has_type_signal(name, type_l)):
+        fallback = str(type_name or "Лежанка для животных").strip()
+        extra = ", ".join(p for p in (color_ru, steps, dims) if p)
+        name = f"{fallback}, {extra}" if extra else fallback
+    return name[:200]
 
 
 def apply_fixed_package_attributes(attributes: dict[str, Any] | None) -> dict[str, Any]:
@@ -243,33 +422,69 @@ def _package_metrics_usable(
     return _package_density_issue(int(depth), int(width), int(height), int(weight)) is None
 
 
+def _variant_explicit_package(
+    variant_attributes: dict[str, Any] | None,
+) -> tuple[int | None, int | None, int | None, int | None]:
+    """变体上显式写入的包装长宽高/重量（审核中心或修复脚本）。"""
+    attrs = {
+        str(k): v
+        for k, v in (variant_attributes or {}).items()
+        if v is not None and str(v).strip()
+    }
+    if not attrs:
+        return None, None, None, None
+    depth, width, height = _parse_dimensions_from_attributes(attrs)
+    # 也认 depth_mm / width_mm / height_mm / weight_g
+    depth = depth or _parse_dimension_mm(attrs.get("depth_mm") or attrs.get("length_mm"))
+    width = width or _parse_dimension_mm(attrs.get("width_mm"))
+    height = height or _parse_dimension_mm(attrs.get("height_mm"))
+    weight = _parse_weight_grams(attrs)
+    if weight is None:
+        weight = _parse_dimension_mm(attrs.get("weight_g") or attrs.get("weight"))
+    return depth, width, height, weight
+
+
 def read_variant_package_metrics(
     edit_attributes: dict[str, Any],
     variant: dict[str, Any] | None = None,
 ) -> tuple[int | None, int | None, int | None, int | None]:
     """
-    包裹尺寸以编辑属性为准。
+    优先用变体自己的包装尺寸/重量；否则回落到商品级（或统一默认）。
     变体标题里的「85 см」和袖长这类特征不能写成包装毫米。
     """
+    variant = variant or {}
+    v_depth, v_width, v_height, v_weight = _variant_explicit_package(
+        variant.get("variant_attributes") if isinstance(variant.get("variant_attributes"), dict) else {}
+    )
+    if v_depth and v_width and v_height and v_weight:
+        return v_depth, v_width, v_height, v_weight
+
     if force_package_metrics_enabled() and not package_is_manual(edit_attributes):
         return get_fixed_package_metrics()
-    base_depth, base_width, base_height, weight = read_package_metrics(edit_attributes or {})
-    if package_is_manual(edit_attributes) or force_package_metrics_enabled():
-        return base_depth, base_width, base_height, weight
 
-    variant = variant or {}
+    base_depth, base_width, base_height, weight = read_package_metrics(edit_attributes or {})
+
+    # 商品级手改/统一尺寸时，仍允许变体覆盖缺省轴
+    if package_is_manual(edit_attributes) or force_package_metrics_enabled():
+        return (
+            v_depth or base_depth,
+            v_width or base_width,
+            v_height or base_height,
+            v_weight or weight,
+        )
+
     merged: dict[str, Any] = {}
     for key, value in (variant.get("variant_attributes") or {}).items():
         if value is None or not str(value).strip() or not _is_explicit_package_key(str(key)):
             continue
         merged[str(key)] = value
 
-    v_depth, v_width, v_height = _parse_dimensions_from_attributes(merged)
+    p_depth, p_width, p_height = _parse_dimensions_from_attributes(merged)
     return (
-        v_depth or base_depth,
-        v_width or base_width,
-        v_height or base_height,
-        weight,
+        v_depth or p_depth or base_depth,
+        v_width or p_width or base_width,
+        v_height or p_height or base_height,
+        v_weight or weight,
     )
 
 
@@ -489,6 +704,82 @@ def collect_listing_issues(edit: dict[str, Any]) -> list[dict[str, Any]]:
         )
 
     issues.extend(package_metrics_issues(attributes, edit.get("variants") or []))
+    # 双区分项：颜色×尺码组合必须唯一，且两侧都要有值
+    from services.ozon_attribute_fill import (
+        detect_variant_aspect_mode,
+        enrich_variant_aspect_fields,
+        listing_color_label,
+        listing_size_label,
+        normalize_variant_aspect,
+    )
+
+    def _pair_key(value: str) -> str:
+        return re.sub(r"\s+", "", str(value or "").strip().lower())
+
+    aspect_mode = normalize_variant_aspect(attributes.get("variant_aspect"))
+    detected = detect_variant_aspect_mode(variants)
+    if detected == "both" and aspect_mode == "size":
+        issues.append(
+            {
+                "code": "DUAL_ASPECT_MODE",
+                "severity": "warning",
+                "message": "变体同时存在多种颜色与尺码，已建议使用「颜色+尺码」双区分；当前为纯尺码轴可能丢颜色",
+            }
+        )
+    seen_pairs: dict[tuple[str, str], str] = {}
+    for variant in variants:
+        sku = str(variant.get("sku") or "").strip() or "?"
+        va = enrich_variant_aspect_fields(variant.get("variant_attributes") or {})
+        # 优先用已写入的俄文区分字段（含 чехол 等后缀），避免 listing_* 把区分信息压扁导致误报撞车
+        color = str(va.get("Название цвета") or va.get("颜色") or "").strip()
+        if not color or any("\u4e00" <= ch <= "\u9fff" for ch in color):
+            color = (
+                listing_color_label(va.get("颜色"), va.get("Цвет"), va.get("Название цвета"), variant.get("title"))
+                or str(va.get("颜色") or "").strip()
+            )
+        size = str(va.get("Размер") or va.get("尺码") or "").strip()
+        if not size or any("\u4e00" <= ch <= "\u9fff" for ch in size):
+            size = listing_size_label(
+                va.get("尺码"),
+                va.get("Размер"),
+                va.get("规格"),
+                va.get("区分项"),
+                variant.get("title"),
+            )
+        if detected == "both" or aspect_mode == "both":
+            if not color:
+                issues.append(
+                    {
+                        "code": "MISSING_VARIANT_COLOR",
+                        "severity": "error",
+                        "message": f"双区分项变体 {sku} 缺少颜色/款式",
+                    }
+                )
+            if not size:
+                issues.append(
+                    {
+                        "code": "MISSING_VARIANT_SIZE",
+                        "severity": "error",
+                        "message": f"双区分项变体 {sku} 缺少尺码/阶数（如 3 ступени）",
+                    }
+                )
+        pair = (_pair_key(color), _pair_key(size))
+        if color or size:
+            prev = seen_pairs.get(pair)
+            if prev:
+                issues.append(
+                    {
+                        "code": "DUPLICATE_ASPECT_PAIR",
+                        "severity": "error",
+                        "message": (
+                            f"变体 {sku} 与 {prev} 的颜色+尺码组合重复"
+                            f"（{color or '-'} / {size or '-'}），合卡会被 Ozon 拒绝"
+                        ),
+                    }
+                )
+            else:
+                seen_pairs[pair] = sku
+
     missing_attrs = str(attributes.get("missing_required_attributes") or "").strip()
     if missing_attrs:
         issues.append(
@@ -609,37 +900,109 @@ def _colors_for_merged_card(
     attributes: dict[str, Any],
     edit: dict[str, Any],
 ) -> dict[str, str]:
-    """合卡前先算每个变体的颜色。同色时用标题里独有的规格分开，避免可变特性完全一样。"""
-    from services.ozon_attribute_fill import disambiguate_variant_colors, listing_color_label
+    """合卡颜色：字典用基础色，冲突花色写出区分名。尺码走 Размеры, мм。"""
+    from services.ozon_attribute_fill import (
+        disambiguate_variant_colors,
+        listing_color_label,
+        listing_size_label,
+    )
 
     if str(attributes.get("variant_aspect") or "") == "size":
         return {}
+    size_by_sku: dict[str, str] = {}
     pending: list[tuple[str, str, str]] = []
     for variant in variants:
         sku = str(variant.get("sku") or "").strip()
-        va = variant.get("variant_attributes") or {}
-        existing_color = str(
-            va.get("Цвет товара") or va.get("Цвет") or va.get("Название цвета") or ""
+        from services.ozon_attribute_fill import enrich_variant_aspect_fields
+
+        va = enrich_variant_aspect_fields(variant.get("variant_attributes") or {})
+        blob = str(
+            va.get("Цвет товара")
+            or va.get("Цвет")
+            or va.get("Название цвета")
+            or va.get("颜色")
+            or va.get("区分项")
+            or va.get("规格")
+            or ""
         ).strip()
         color = listing_color_label(
-            existing_color,
+            blob,
             variant.get("title"),
             variant.get("url"),
             edit.get("title"),
         )
+        size = listing_size_label(
+            va.get("Размер"),
+            va.get("尺码"),
+            va.get("规格"),
+            va.get("区分项"),
+            blob,
+            variant.get("title"),
+        )
+        if size:
+            size_by_sku[sku] = size
         if not color:
-            blob = " ".join(
+            text_blob = " ".join(
                 str(x or "")
-                for x in (
-                    variant.get("title"),
-                    edit.get("title"),
-                    attributes.get("Материал"),
-                )
+                for x in (variant.get("title"), edit.get("title"), attributes.get("Материал"))
             ).lower()
-            if any(token in blob for token in ("брезент", "tarpaulin", "canvas", "утеплен")):
+            if any(token in text_blob for token in ("брезент", "tarpaulin", "canvas", "утеплен")):
                 color = "серый"
-        pending.append((sku, color, str(variant.get("title") or "")))
-    return disambiguate_variant_colors(pending)
+        hint = str(
+            va.get("颜色")
+            or va.get("规格")
+            or va.get("区分项")
+            or variant.get("title")
+            or ""
+        )
+        pending.append((sku, color, hint))
+
+    # 仅当「同色 + 同尺码」撞车时才加花色区分；不同尺码可共用同一基础色
+    from collections import defaultdict
+
+    by_color_size: dict[tuple[str, str], list[tuple[str, str, str]]] = defaultdict(list)
+    for sku, color, hint in pending:
+        size_key = size_by_sku.get(sku) or ""
+        by_color_size[(str(color or "").strip().lower(), size_key)].append((sku, color, hint))
+
+    resolved: dict[str, str] = {}
+    collide_rows: list[tuple[str, str, str]] = []
+    for (_color_key, _size_key), rows in by_color_size.items():
+        if len(rows) == 1:
+            sku, color, _hint = rows[0]
+            resolved[sku] = color
+        else:
+            collide_rows.extend(rows)
+
+    if collide_rows:
+        resolved.update(disambiguate_variant_colors(collide_rows))
+    return resolved
+
+
+def _size_mm_for_merged_card(
+    variants: list[dict[str, Any]],
+    *,
+    height_mm: int = 80,
+) -> dict[str, str]:
+    """每个变体写入 Размеры, мм 的唯一毫米尺寸。"""
+    from services.ozon_attribute_fill import enrich_variant_aspect_fields, listing_aspect_size_mm
+
+    out: dict[str, str] = {}
+    for variant in variants:
+        sku = str(variant.get("sku") or "").strip()
+        va = enrich_variant_aspect_fields(variant.get("variant_attributes") or {})
+        mm = listing_aspect_size_mm(
+            va.get("Размер"),
+            va.get("尺码"),
+            va.get("规格"),
+            va.get("区分项"),
+            va.get("颜色"),
+            variant.get("title"),
+            height_mm=height_mm,
+        )
+        if mm:
+            out[sku] = mm
+    return out
 
 
 def build_import_items(
@@ -647,7 +1010,16 @@ def build_import_items(
     *,
     warnings: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    attributes = edit.get("attributes") or {}
+    attributes = dict(edit.get("attributes") or {})
+    # 合卡型号拼 external_id，避免与店铺内其它商品撞名
+    external = str(edit.get("family_external_id") or attributes.get("external_id") or "").strip()
+    if external:
+        attributes.setdefault("family_external_id", external)
+        # 若旧数据已写入过短型号，强制带上货号后缀
+        model_key = "Название модели (для объединения в одну карточку)"
+        old_model = str(attributes.get(model_key) or attributes.get("Название модели") or "").strip()
+        if old_model and external not in old_model and "-" + external not in old_model:
+            attributes[model_key] = f"{old_model}-{external}"[:80]
 
     description_category_id = _as_int_id(
         attributes.get("description_category_id") or attributes.get("category_id")
@@ -657,6 +1029,39 @@ def build_import_items(
         raise OzonSellerError(
             "缺少 description_category_id 或 type_id，请配置 OZON_COOKIE 后自动获取"
         )
+
+    # 纠正「名称是躺垫、类型却是狗窝」这类错配，否则 Ozon 报 Неверный тип
+    from services.ozon_category_tree import (
+        find_category_id_for_type,
+        find_type_name,
+        suggest_type_id_from_text,
+    )
+
+    title_blob = " ".join(
+        [
+            str(edit.get("title") or ""),
+            str(attributes.get("Тип") or ""),
+            *[
+                str((v.get("title") or ""))
+                + " "
+                + str((v.get("variant_attributes") or {}).get("规格") or "")
+                + " "
+                + str((v.get("variant_attributes") or {}).get("颜色") or "")
+                for v in (edit.get("variants") or [])[:8]
+            ],
+        ]
+    )
+    suggested_type = suggest_type_id_from_text(title_blob, current_type_id=type_id)
+    if suggested_type and suggested_type != type_id:
+        type_id = suggested_type
+        attributes["type_id"] = str(suggested_type)
+        attributes["Тип"] = find_type_name(suggested_type) or attributes.get("Тип")
+        corrected_cat = find_category_id_for_type(suggested_type)
+        if corrected_cat:
+            description_category_id = int(corrected_cat)
+            attributes["description_category_id"] = str(corrected_cat)
+            attributes["category_id"] = str(corrected_cat)
+    type_name = find_type_name(type_id) or str(attributes.get("Тип") or "")
 
     variants = [v for v in (edit.get("variants") or []) if str(v.get("sku") or "").strip()]
     package_errors = package_metrics_issues(attributes, variants)
@@ -672,8 +1077,19 @@ def build_import_items(
         apply_variant_distinguishing_attributes,
         build_ozon_attribute_values,
         contains_cjk,
+        detect_variant_aspect_mode,
+        enrich_variant_aspect_fields,
+        listing_size_label,
+        normalize_variant_aspect,
         strip_cjk,
     )
+
+    # 双区分项：矩阵两侧都有差异时强制 both，避免只交颜色导致阶数/尺码丢失
+    aspect_mode = normalize_variant_aspect(attributes.get("variant_aspect"))
+    detected_aspect = detect_variant_aspect_mode(variants)
+    if detected_aspect == "both" and aspect_mode != "both":
+        aspect_mode = "both"
+    attributes["variant_aspect"] = aspect_mode
 
     ozon_attrs, missing_required = build_ozon_attribute_values(
         description_category_id=description_category_id,
@@ -711,6 +1127,7 @@ def build_import_items(
     items: list[dict[str, Any]] = []
     fallback_images = [url for url in (edit.get("images") or []) if isinstance(url, str) and url.strip()]
     color_by_sku = _colors_for_merged_card(variants, attributes, edit)
+    size_mm_by_sku = _size_mm_for_merged_card(variants)
     # 多变体合卡：每个 offer 仍是独立 listing，图集互不共用
     for variant in variants:
         sku = str(variant.get("sku") or "").strip()
@@ -718,32 +1135,65 @@ def build_import_items(
         if price is None:
             raise OzonSellerError(f"变体 {sku} 缺少价格，请先填写价格后再发布")
         depth, width, height, weight = read_variant_package_metrics(attributes, variant)
+        # 兴远：尺寸优先选档，重量至少抬到渠道下限（避免物流不可选）
+        if depth and width and height and weight:
+            from services.xingyuan_freight import FreightError, normalize_package_for_shipping
+
+            try:
+                normalized = normalize_package_for_shipping(int(depth), int(width), int(height), float(weight))
+                depth = int(normalized["depth_mm"])
+                width = int(normalized["width_mm"])
+                height = int(normalized["height_mm"])
+                weight = int(normalized["weight_g"])
+            except FreightError:
+                pass
         item_images = _build_variant_listing_images(variant, fallback_images)
         # 把变体尺寸/重量写入区分属性（供 Ozon 特征表展示）
-        va = dict(variant.get("variant_attributes") or {})
+        va = enrich_variant_aspect_fields(variant.get("variant_attributes") or {})
+        # 包裹尺寸只进包装字段/顶层 depth，不要写进可变特性「Размеры, мм」
         if depth is not None and width is not None and height is not None:
-            va.setdefault("Размеры, мм", f"{depth}*{width}*{height}")
             va["Размер упаковки (Длина х Ширина х Высота), см"] = (
                 f"{max(1, round(depth / 10))}x{max(1, round(width / 10))}x{max(1, round(height / 10))}"
             )
-        net_depth, net_width, net_height = read_net_product_mm(va)
-        if not (net_depth and net_width and net_height):
-            net_depth, net_width, net_height = read_net_product_mm(attributes)
-        if net_depth and net_width and net_height:
-            net_text = f"{net_depth}*{net_width}*{net_height}"
-            va["Размеры, мм"] = net_text
-            va["Размеры товара, мм"] = net_text
+        aspect_mm = size_mm_by_sku.get(sku) or ""
+        size_label = listing_size_label(
+            va.get("Размер"),
+            va.get("尺码"),
+            va.get("规格"),
+            va.get("区分项"),
+            variant.get("title"),
+        )
+        if size_label:
+            va["Размер"] = size_label
+            va["尺码"] = size_label
+            va["Размер товара"] = size_label
+        if aspect_mm:
+            va["Размеры, мм"] = aspect_mm
+            va["Размеры товара, мм"] = aspect_mm
+        else:
+            net_depth, net_width, net_height = read_net_product_mm(va)
+            if not (net_depth and net_width and net_height):
+                net_depth, net_width, net_height = read_net_product_mm(attributes)
+            if net_depth and net_width and net_height:
+                net_text = f"{net_depth}*{net_width}*{net_height}"
+                va["Размеры, мм"] = net_text
+                va["Размеры товара, мм"] = net_text
         if weight is not None:
             va.setdefault("Вес товара, г", str(int(weight)))
             va.setdefault("Вес с упаковкой, г", str(int(weight)))
-        if str(attributes.get("variant_aspect") or "") == "size":
+        # 纯尺码轴才去掉颜色；both/color 都保留颜色
+        if aspect_mode == "size":
             for key in ("Цвет", "Цвет товара", "Название цвета"):
                 va.pop(key, None)
         else:
             color = color_by_sku.get(sku) or ""
             if color:
-                va["Цвет"] = color
-                va["Цвет товара"] = color
+                from services.ozon_attribute_fill import infer_color_label, listing_color_label
+
+                # 字典色用基础色；Название цвета 用带花色的区分名，避免同尺寸多花色撞车
+                base = infer_color_label(color) or listing_color_label(color) or color.split()[0]
+                va["Цвет"] = base
+                va["Цвет товара"] = base
                 va["Название цвета"] = color
         variant_attrs = apply_variant_distinguishing_attributes(
             ozon_attrs,
@@ -751,7 +1201,7 @@ def build_import_items(
             type_id=type_id,
             variant_attributes=va,
             edit_title=str(variant.get("title") or edit.get("title") or ""),
-            variant_aspect=str(attributes.get("variant_aspect") or "color"),
+            variant_aspect=aspect_mode,
         )
         price_num = float(price)
         old_price_num = round(price_num * 1.3, 2)
@@ -760,8 +1210,34 @@ def build_import_items(
         else:
             old_price_str = str(old_price_num)
         price_str = str(int(price_num) if float(price_num).is_integer() else price_num)
-        name = strip_cjk(variant.get("title") or edit.get("title") or "") or sku
+        va_for_name = dict(variant.get("variant_attributes") or {})
+        size_hint = str(
+            va_for_name.get("规格")
+            or va_for_name.get("Размер")
+            or va_for_name.get("尺码")
+            or aspect_mm
+            or ""
+        )
+        name = build_ozon_item_name(
+            variant_title=str(variant.get("title") or ""),
+            edit_title=str(edit.get("title") or ""),
+            color=str(
+                color_by_sku.get(sku)
+                or va_for_name.get("Название цвета")
+                or va_for_name.get("Цвет товара")
+                or va_for_name.get("Цвет")
+                or ""
+            ),
+            size_hint=size_hint,
+            type_name=type_name,
+        )
         item_description = strip_cjk(description) if contains_cjk(description) else description
+        if contains_cjk(item_description) or not str(item_description or "").strip():
+            item_description = strip_cjk(edit.get("description") or "") or str(
+                edit.get("description") or ""
+            )
+        if contains_cjk(item_description):
+            item_description = str(edit.get("title") or name)
         item: dict[str, Any] = {
             "offer_id": sku,
             "name": name,

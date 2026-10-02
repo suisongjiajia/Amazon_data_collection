@@ -229,10 +229,11 @@ def test_build_import_items_per_variant_package_dimensions(monkeypatch):
         ],
     }
     items = build_import_items(edit)
+    # 36×36×36cm 三边和>90 → Small，计费重量至少 551g
     assert [(i["offer_id"], i["depth"], i["width"], i["height"], i["weight"]) for i in items] == [
-        ("OZON-A", 360, 360, 360, 500),
-        ("OZON-B", 330, 330, 330, 500),
-        ("OZON-C", 420, 420, 420, 500),
+        ("OZON-A", 360, 360, 360, 551),
+        ("OZON-B", 330, 330, 330, 551),
+        ("OZON-C", 420, 420, 420, 551),
     ]
     assert items[0]["old_price"] == "70.2"
     assert items[0]["price"] == "54"
